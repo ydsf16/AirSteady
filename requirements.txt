@@ -1,0 +1,3 @@
+ultralytics
+pyside6
+pyinstaller
