@@ -1,0 +1,48 @@
+<!--?xml version="1.0" encoding="UTF-8"?-->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+
+  <!-- 背景：深蓝圆角方块 -->
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="#0D1933"></rect>
+
+  <!-- 外层取景框四角（青色） -->
+  <!-- 左上角 -->
+  <path d="M140 120 H220 M120 140 V220" stroke="#18B7FF" stroke-width="10" stroke-linecap="round"></path>
+  <!-- 右上角 -->
+  <path d="M292 120 H372 M392 140 V220" stroke="#18B7FF" stroke-width="10" stroke-linecap="round"></path>
+  <!-- 左下角 -->
+  <path d="M120 292 V372 M140 392 H220" stroke="#18B7FF" stroke-width="10" stroke-linecap="round"></path>
+  <!-- 右下角 -->
+  <path d="M392 292 V372 M292 392 H372" stroke="#18B7FF" stroke-width="10" stroke-linecap="round"></path>
+
+  <!-- 中心轻微十字准星（淡一点） -->
+  <line x1="256" y1="210" x2="256" y2="302" stroke="#18B7FF" stroke-width="4" stroke-linecap="round" opacity="0.7"></line>
+  <line x1="210" y1="256" x2="302" y2="256" stroke="#18B7FF" stroke-width="4" stroke-linecap="round" opacity="0.7"></line>
+
+  <!-- 飞机目标框（绿色） -->
+  <rect x="260" y="190" width="110" height="90" rx="14" fill="none" stroke="#55E38C" stroke-width="5"></rect>
+
+  <!-- 飞机剪影（白色，简单喷气机侧视） -->
+  <path d="M330 200
+       L360 215
+       L332 222
+       L350 245
+       L332 248
+       L320 270
+       L305 250
+       L290 252
+       L295 235
+       L280 215
+       Z" fill="#FFFFFF"></path>
+
+  <!-- 尾迹（青色渐隐小点） -->
+  <circle cx="270" cy="260" r="5" fill="#18B7FF" opacity="0.8"></circle>
+  <circle cx="248" cy="272" r="4" fill="#18B7FF" opacity="0.5"></circle>
+  <circle cx="228" cy="282" r="3" fill="#18B7FF" opacity="0.3"></circle>
+
+  <!-- 底部条 + AS 字母（可选） -->
+  <rect x="16" y="400" width="480" height="96" rx="40" fill="#172748" opacity="0.95"></rect>
+  <text x="50%" y="455" text-anchor="middle" font-family="Segoe UI, Roboto, system-ui, sans-serif" font-size="60" fill="#FFFFFF">
+    AS
+  </text>
+
+</svg>

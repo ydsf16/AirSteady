@@ -4,6 +4,7 @@ import numpy as np
 from collections import defaultdict
 from ultralytics import YOLO
 import sys
+import torch
 
 def resource_path(relative_path: str) -> str:
     """兼容普通运行和 PyInstaller 打包后的资源路径."""
@@ -33,8 +34,8 @@ class AirSteadyEngine:
     def __init__(
         self,
         model_path: str = "model.pt",
-        crop_ratio: float = 0.8,
-        ema_alpha: float = 0.9,
+        crop_ratio: float = 0.7,
+        ema_alpha: float = 0.6,
         candidate_names=None,
         lost_threshold_frames: int = 10,
         mode: str = "semi",  # "semi" 半自动; "auto" 全自动（简单自动接上）
@@ -61,8 +62,14 @@ class AirSteadyEngine:
         self.lost_threshold_frames = int(lost_threshold_frames)
         self.mode = mode
 
+        self.tracker_cfg = resource_path(os.path.join("model", "tracker.yaml"))
+
         # YOLO 模型
+        # self.model = YOLO(self.model_path)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = YOLO(self.model_path)
+        self.model.to(self.device)
+
         names = self.model.names  # dict: {0: 'person', ...}
         self.candidate_cls_ids = [
             i for i, n in names.items() if n in self.candidate_names
@@ -313,7 +320,7 @@ class AirSteadyEngine:
         self.current_frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
 
         # YOLO 跟踪（persist=True 保留 track id）
-        result = self.model.track(frame, persist=True, verbose=False)[0]
+        result = self.model.track(frame, persist=True, verbose=False, device=self.device, tracker=self.tracker_cfg) [0]
         self.last_result = result
 
         vis_frame = result.plot()
