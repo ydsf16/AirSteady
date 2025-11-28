@@ -2,6 +2,8 @@ import os
 import sys
 import tempfile
 from uuid import uuid4
+from pathlib import Path
+import sys
 
 def get_airsteady_cache_dir() -> str:
     """

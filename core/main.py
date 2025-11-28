@@ -3,11 +3,17 @@ from enum import Enum, auto
 import os
 import time
 import subprocess  # ⭐ 新增：用于调用 ffmpeg
+import shutil
+import zipfile
 
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, QRectF, Signal, QThread, QObject, Slot, QEvent
-from PySide6.QtGui import QPainter, QColor, QFont, QPixmap, QMouseEvent, QImage
+from PySide6.QtGui import (
+    QPainter, QColor, QFont, QPixmap, QMouseEvent, QImage,
+    QPolygonF, QRadialGradient, QPen
+)
+from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -29,10 +35,13 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QMessageBox,
 )
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QUrl
 
 from algorithm import TrackEngine  # 你的算法文件
 import algorithm
 import utils
+#
 
 
 class AppState(Enum):
@@ -67,8 +76,14 @@ class VideoView(QWidget):
         self._target_rect: QRectF | None = None  # 0~1 归一化坐标
         self._last_draw_rect = QRectF()
         self._overlay_center = True
+        self._show_play_icon = False   # ⭐ 是否显示大播放按钮
 
         self.setMinimumSize(320, 240)
+    
+    def set_play_icon_visible(self, visible: bool):
+        """控制是否显示中间的大播放按钮"""
+        self._show_play_icon = bool(visible)
+        self.update()
 
     def set_frame_pixmap(self, pix: QPixmap | None):
         self._pixmap = pix
@@ -197,6 +212,52 @@ class VideoView(QWidget):
                 Qt.AlignCenter | Qt.AlignVCenter,
                 self._warn_overlay_text,
             )
+        
+        # 画中间的大播放按钮（比如预览暂停状态）
+        if self._show_play_icon and not content_rect.isEmpty():
+            painter.setRenderHint(QPainter.Antialiasing, True)
+
+            # 图标大小：占内容区域较短边的 20%
+            size = min(content_rect.width(), content_rect.height()) * 0.10
+            radius = size / 2.0
+            center = content_rect.center()
+
+            # 1) 外圈柔和阴影
+            shadow_rect = QRectF(
+                center.x() - radius - 3,
+                center.y() - radius - 3,
+                size + 6,
+                size + 6,
+            )
+            painter.setBrush(QColor(0, 0, 0, 120))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(shadow_rect)
+
+            # 2) 半透明渐变圆（轻微“玻璃”质感）
+            circle_rect = QRectF(
+                center.x() - radius,
+                center.y() - radius,
+                size,
+                size,
+            )
+            grad = QRadialGradient(circle_rect.center(), radius)
+            grad.setColorAt(0.0, QColor(255, 255, 255, 40))   # 中心一点点高光
+            grad.setColorAt(1.0, QColor(0, 0, 0, 190))        # 边缘更深
+
+            painter.setBrush(grad)
+            painter.setPen(QPen(QColor(255, 255, 255, 220), 1.6))
+            painter.drawEllipse(circle_rect)
+
+            # 3) 内部白色 ▶ 三角形
+            tri_r = radius * 0.58
+            p1 = QPointF(center.x() - tri_r * 0.35, center.y() - tri_r)
+            p2 = QPointF(center.x() - tri_r * 0.35, center.y() + tri_r)
+            p3 = QPointF(center.x() + tri_r,          center.y())
+            triangle = QPolygonF([p1, p2, p3])
+
+            painter.setBrush(QColor(255, 255, 255, 235))
+            painter.setPen(Qt.NoPen)
+            painter.drawPolygon(triangle)
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton and not self._last_draw_rect.isNull():
@@ -621,6 +682,43 @@ class MainWindow(QMainWindow):
 
         self.warn_visible_until = 0.0
     
+    def _on_feedback_clicked(self):
+        """打开问题反馈窗口。"""
+        # 确保至少已经加载过一个视频
+        if not self.track_engine or not self.track_engine.video_path :
+            QMessageBox.information(
+                self,
+                "温馨提示",
+                "请打开问题视频，处理完成后，再提交问题反馈。"
+            )
+            return
+        
+        print("sefl.stat: ", self.state)
+        if self.state != AppState.PLAN_DONE :
+            QMessageBox.information(
+                self,
+                "温馨提示",
+                "请打开问题视频，处理完成后，再提交问题反馈。"
+            )
+            return
+
+
+        # 预览用的小视频，如果还没生成，就退回到原始视频
+        raw_preview = self.preview_raw_path if os.path.exists(self.preview_raw_path) else self.track_engine.video_path
+        steady_preview = (
+            self.preview_steady_path
+            if self.preview_steady_path and os.path.exists(self.preview_steady_path)
+            else raw_preview
+        )
+
+        dlg = FeedbackDialog(
+            parent=self,
+            src_video_path=self.track_engine.video_path,
+            raw_preview_path=raw_preview,
+            steady_preview_path=steady_preview,
+        )
+        dlg.exec()
+
     def _mux_audio_from_source(self, src_video: str, dst_video: str):
         """
         使用内置 ffmpeg 将原始视频的音频轨道拷贝到稳像后的视频中。
@@ -808,7 +906,18 @@ class MainWindow(QMainWindow):
         self.control_panel.cropChanged.connect(self._on_crop_changed)
         self.control_panel.recompute.clicked.connect(self._on_recompute_clicked)
 
-        self.raw_view.clicked.connect(self._on_raw_view_clicked)
+        self.raw_view.clicked.connect(self._on_preview_view_clicked)
+
+        # ⭐ 新增：在稳像结果窗口点击也可以播放/暂停
+        self.steady_view.clicked.connect(self._on_preview_view_clicked)
+
+        # ⭐ 新增：问题反馈
+        self.feedback_btn.clicked.connect(self._on_feedback_clicked)
+    
+    def _on_preview_view_clicked(self, x_norm: float, y_norm: float):
+        """预览阶段点击画面：切换播放/暂停。"""
+        if self.state == AppState.PLAN_DONE and self.preview_cap_raw and self.preview_cap_raw.isOpened():
+            self._toggle_preview_play_pause()
 
     # ---------------- 一些重置工具 ----------------
     def _reset_preview_player(self):
@@ -837,6 +946,8 @@ class MainWindow(QMainWindow):
         self.timeline_slider.setValue(0)
         self.timeline_slider.blockSignals(False)
         self._update_time_label(0, 0, 1.0)  # 00:00 / 00:00
+        self.steady_view.set_play_icon_visible(False)
+        self.raw_view.set_play_icon_visible(False)
 
     # ---------------- 状态切换 ----------------
     def _update_state(self, new_state: AppState):
@@ -847,6 +958,9 @@ class MainWindow(QMainWindow):
         self.play_btn.setEnabled(False)
         self.prev_btn.setEnabled(False)
         self.timeline_slider.setEnabled(False)
+        # 先默认关闭播放图标
+        self.steady_view.set_play_icon_visible(False)
+        self.raw_view.set_play_icon_visible(False)
 
         if new_state == AppState.IDLE:
             self._reset_video_views()
@@ -896,19 +1010,28 @@ class MainWindow(QMainWindow):
             self.play_btn.setText("▶")
             self.control_panel.recompute.setEnabled(True)
 
+            hint = (
+                "稳像完成：按空格开始播放预览\n"
+                "若不稳，请在右侧减少裁切保留比例 + 强力稳像 -> 「重新运镜」"
+            )
+
             self.raw_view.set_overlay(
-                "稳像完成，请播放预览效果 -> 导出视频\n若效果不佳，请减少裁切保留比例+强力稳像 -> 重新运镜",
+                hint,
                 center=False,
                 color=QColor(255, 200, 200),
             )
 
             self.steady_view.set_overlay(
-                "稳像完成，可播放预览效果 -> 导出视频\n若效果不佳，请减少裁切保留比例+强力稳像 -> 重新运镜",
+                hint,
                 center=False,
                 color=QColor(255, 200, 200),
             )
 
-            self.status.showMessage("稳像完成，可播放预览效果")
+            self.status.showMessage("稳像完成，可点击画面或按空格播放预览")
+
+            # ⭐ 预览初始是“暂停”状态，在画面中间显示大播放按钮
+            self.steady_view.set_play_icon_visible(True)
+            self.raw_view.set_play_icon_visible(True)
 
         elif new_state == AppState.EXPORTING:
             self.open_btn.setEnabled(False)
@@ -1039,8 +1162,11 @@ class MainWindow(QMainWindow):
 
     def _toggle_preview_play_pause(self):
         if self.preview_timer.isActive():
+            # 正在播 -> 暂停
             self.preview_timer.stop()
             self.play_btn.setText("▶")
+            self.steady_view.set_play_icon_visible(True)   # ⭐ 显示播放图标
+            self.raw_view.set_play_icon_visible(True)
         else:
             if self.preview_fps <= 1e-3:
                 interval = 33
@@ -1049,6 +1175,8 @@ class MainWindow(QMainWindow):
             self.preview_timer.setInterval(max(1, interval))
             self.preview_timer.start()
             self.play_btn.setText("⏸")
+            self.steady_view.set_play_icon_visible(False)  # ⭐ 播放中隐藏图标
+            self.raw_view.set_play_icon_visible(False)
 
     def _on_prev_clicked(self):
         if self.state != AppState.PLAN_DONE:
@@ -1395,7 +1523,7 @@ class MainWindow(QMainWindow):
         # complete ratio
         complete_ratio = 100 * float(frame_idx) / max(1, total_frames)
         self.raw_view.set_overlay(
-            f"跟踪中...{int(round(complete_ratio))}%\n跟踪完成后将自动规划运镜",
+            f"跟踪中...{int(round(complete_ratio))}%\n[请知悉：内测版只跟踪单物体画面]",
             center=False,
         )
 
@@ -1442,10 +1570,12 @@ class MainWindow(QMainWindow):
 
         # 默认不自动播放，等用户按播放键或空格
         self.play_btn.setText("▶")
+        self.steady_view.set_play_icon_visible(True)   # ⭐ 一进预览就显示大播放图标
+        self.raw_view.set_play_icon_visible(True)
 
     def _update_steady_overlay_with_clamp(self, frame_idx: int):
         """根据当前帧的 clamp 标记，在稳像视频上显示/隐藏警告提示（带延时清理）。"""
-        warn_text = "超过最大裁切范围\n建议减少裁切保留比例后，点击重算运镜"
+        warn_text = "超过最大裁切范围\n建议在右侧减少裁切保留比例后，点击[重算运镜]"
 
         now = time.monotonic()  # 当前时间（单调递增，适合做时间间隔判断）
         show_warn = False
@@ -1527,6 +1657,9 @@ class MainWindow(QMainWindow):
         self._update_time_label(frame_idx, self.preview_total_frames, self.preview_fps)
 
         self._update_steady_overlay_with_clamp(frame_idx)
+        # ⭐ 跳帧后处于暂停状态，显示播放图标
+        self.steady_view.set_play_icon_visible(True)
+        self.raw_view.set_play_icon_visible(True)
 
     def _update_time_label(self, frame_idx: int, total_frames: int, fps: float):
         fps = max(fps, 1e-3)
@@ -1545,5 +1678,317 @@ def main():
     sys.exit(app.exec())
 
 
+class FeedbackDialog(QDialog):
+    """
+    问题反馈窗口：
+    1) 顶部：隐私说明文案
+    2) 中部：左右两个预览视频 + 时间轴，用户拖动选中“问题发生的位置”
+    3) 底部：「打包反馈数据」按钮
+       - 以选中时间为中心，前后各 5 秒，从原始视频截取一段原始分辨率片段
+       - 收集 AppData 目录下的 log
+       - 打成一个 zip，让用户选择保存路径
+       - 弹出反馈链接，提示用户上传压缩包并描述问题
+    """
+
+    def __init__(self, parent, src_video_path: str,
+                 raw_preview_path: str, steady_preview_path: str):
+        super().__init__(parent)
+        self.setWindowTitle("问题反馈")
+        self.resize(1100, 720)
+
+        self.src_video_path = src_video_path
+        self.raw_preview_path = raw_preview_path
+        self.steady_preview_path = steady_preview_path
+
+        self.cap_raw: cv2.VideoCapture | None = None
+        self.cap_steady: cv2.VideoCapture | None = None
+
+        self.video_fps: float = 25.0
+        self.total_frames: int = 0
+
+        self._build_ui()
+        self._init_preview()
+
+    # ---------- UI ----------
+
+    def _build_ui(self):
+        # 顶部隐私说明
+        tip = QLabel(
+            "【问题反馈说明】\n"
+            "\n"
+            "为帮助我们改进 AirSteady，在您同意的前提下，程序会收集并打包以下数据生成一个压缩包：\n"
+            " • 日志文件（log）\n"
+            " • 一小段原始分辨率的视频片段（约 10 秒，取自您当前选中时间点前后各 5 秒）\n"
+            " • 基础设备信息（可能包含在日志中，例如操作系统版本等）\n"
+            "\n"
+            "我们承诺：上述数据仅用于分析问题和优化 AirSteady，不会对外传播，"
+            "也不会用于与本工具无关的任何目的。\n"
+            "\n"
+            "如您同意，请先拖动下方进度条，定位到问题出现的大致时间点，"
+            "然后点击「打包反馈数据」按钮。"
+        )
+        # 建议顺手加上：
+        tip.setWordWrap(True)
+
+        # 左右视频预览
+        self.raw_view = VideoView("原始视频（预览）")
+        self.steady_view = VideoView("稳像结果（预览）")
+
+        center_splitter = QSplitter(Qt.Horizontal)
+        center_splitter.addWidget(self.raw_view)
+        center_splitter.addWidget(self.steady_view)
+        center_splitter.setSizes([550, 550])
+
+        # 时间轴 + 时间显示
+        self.timeline_slider = QSlider(Qt.Horizontal)
+        self.timeline_slider.setRange(0, 0)
+        self.timeline_slider.setValue(0)
+
+        self.time_label = QLabel("00:00 / 00:00")
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addWidget(QLabel("定位问题时间："))
+        bottom_row.addWidget(self.timeline_slider, 1)
+        bottom_row.addWidget(self.time_label)
+
+        # 打包按钮
+        self.pack_btn = QPushButton("打包反馈数据")
+        self.pack_btn.setFixedHeight(32)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(tip)
+        layout.addSpacing(10)
+        layout.addWidget(center_splitter, 1)
+        layout.addLayout(bottom_row)
+        layout.addSpacing(8)
+        layout.addWidget(self.pack_btn, alignment=Qt.AlignCenter)
+
+        # 信号连接
+        self.timeline_slider.valueChanged.connect(self._on_slider_changed)
+        self.pack_btn.clicked.connect(self._on_pack_clicked)
+
+    # ---------- 预览初始化 & 播放一帧 ----------
+
+    def _init_preview(self):
+        """打开预览视频，用于选择问题发生的时间点。"""
+        if not os.path.exists(self.raw_preview_path):
+            QMessageBox.warning(self, "预览失败", "找不到预览视频，无法显示问题定位窗口。")
+            return
+
+        self.cap_raw = cv2.VideoCapture(self.raw_preview_path)
+        self.cap_steady = cv2.VideoCapture(
+            self.steady_preview_path if os.path.exists(self.steady_preview_path)
+            else self.raw_preview_path
+        )
+
+        if (not self.cap_raw.isOpened()) or (not self.cap_steady.isOpened()):
+            QMessageBox.warning(self, "预览失败", "打开预览视频失败。")
+            return
+
+        fps = self.cap_raw.get(cv2.CAP_PROP_FPS)
+        if fps <= 1e-3:
+            fps = 25.0
+        self.video_fps = float(fps)
+
+        total_frames = int(self.cap_raw.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.total_frames = max(total_frames, 0)
+
+        self.timeline_slider.blockSignals(True)
+        self.timeline_slider.setRange(0, max(0, self.total_frames - 1))
+        self.timeline_slider.setValue(0)
+        self.timeline_slider.blockSignals(False)
+
+        self._show_frame(0)
+
+    def _show_frame(self, frame_idx: int):
+        """在两个窗口上显示指定帧。"""
+        if not self.cap_raw or not self.cap_steady:
+            return
+
+        frame_idx = max(0, min(frame_idx, max(0, self.total_frames - 1)))
+
+        self.cap_raw.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        self.cap_steady.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+
+        ret1, frame1 = self.cap_raw.read()
+        ret2, frame2 = self.cap_steady.read()
+        if ret1 and frame1 is not None:
+            self.raw_view.set_frame_pixmap(bgr_to_qpixmap(frame1))
+        if ret2 and frame2 is not None:
+            self.steady_view.set_frame_pixmap(bgr_to_qpixmap(frame2))
+
+        self._update_time_label(frame_idx)
+
+    def _update_time_label(self, frame_idx: int):
+        fps = max(self.video_fps, 1e-3)
+        sec_cur = int(frame_idx / fps)
+        sec_all = int(self.total_frames / fps) if self.total_frames > 0 else 0
+
+        cur_str = f"{sec_cur // 60:02d}:{sec_cur % 60:02d}"
+        all_str = f"{sec_all // 60:02d}:{sec_all % 60:02d}"
+        self.time_label.setText(f"{cur_str} / {all_str}")
+
+    def _on_slider_changed(self, value: int):
+        self._show_frame(value)
+
+    # ---------- 打包逻辑 ----------
+
+    def _on_pack_clicked(self):
+        """打包反馈数据：视频片段 + 日志 -> zip。"""
+        if not os.path.exists(self.src_video_path):
+            QMessageBox.warning(self, "打包失败", "原始视频不存在，无法截取反馈片段。")
+            return
+
+        if self.total_frames <= 0 or self.video_fps <= 1e-3:
+            QMessageBox.warning(self, "打包失败", "无法获取视频长度，请尝试重新打开视频后再反馈。")
+            return
+
+        center_frame = self.timeline_slider.value()
+        center_sec = center_frame / self.video_fps
+
+        total_duration_sec = self.total_frames / self.video_fps
+        start_sec = max(0.0, center_sec - 5.0)
+        end_sec = min(total_duration_sec, center_sec + 5.0)
+        duration_sec = max(0.5, end_sec - start_sec)  # 至少 0.5 秒，避免太短
+
+        cache_dir = utils.get_airsteady_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+
+        tmp_clip_path = os.path.join(cache_dir, "feedback_clip.mp4")
+        if os.path.exists(tmp_clip_path):
+            try:
+                os.remove(tmp_clip_path)
+            except OSError:
+                pass
+
+        if not self._extract_video_segment(
+            self.src_video_path,
+            tmp_clip_path,
+            start_sec,
+            duration_sec,
+        ):
+            QMessageBox.warning(self, "打包失败", "截取视频片段失败，请稍后重试。")
+            return
+
+        # 打包 zip
+        tmp_zip_path = os.path.join(cache_dir, "feedback_package.zip")
+        if os.path.exists(tmp_zip_path):
+            try:
+                os.remove(tmp_zip_path)
+            except OSError:
+                pass
+
+        try:
+            with zipfile.ZipFile(tmp_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                # 视频片段
+                if os.path.exists(tmp_clip_path):
+                    zf.write(tmp_clip_path, "video_clip.mp4")
+
+                # 日志文件（AppData\AirSteady\.sys\logs\*）
+                for log_path in self._iter_log_files():
+                    rel_name = os.path.join("logs", os.path.basename(log_path))
+                    try:
+                        zf.write(log_path, rel_name)
+                    except Exception:
+                        pass
+        except Exception as e:
+            QMessageBox.warning(self, "打包失败", f"创建压缩包失败：{e}")
+            return
+
+        # 让用户选择保存位置
+        default_name = "AirSteady_feedback.zip"
+        default_dir = os.path.expanduser("~/Desktop")
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存反馈压缩包",
+            os.path.join(default_dir, default_name),
+            "Zip 文件 (*.zip)",
+        )
+        if not save_path:
+            return
+        if not save_path.lower().endswith(".zip"):
+            save_path += ".zip"
+
+        try:
+            shutil.copyfile(tmp_zip_path, save_path)
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", f"保存压缩包失败：{e}")
+            return
+
+        # 最后提示用户去反馈页面上传压缩包
+        feedback_url = "https://ai.feishu.cn/share/base/form/shrcn6iBl2uQXHIoSBqzQ5JxYFe"  # ⭐ 你换成自己的真实地址
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("打包完成")
+        box.setText(
+            f"反馈压缩包已保存到：\n{save_path}\n\n"
+            "接下来请将压缩包上传到反馈页面，并简要描述问题发生的场景和时间点。"
+        )
+
+        open_btn = box.addButton("打开反馈页面", QMessageBox.AcceptRole)
+        close_btn = box.addButton("稍后再说", QMessageBox.RejectRole)
+
+        box.exec()
+
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl(feedback_url))
+
+    def _extract_video_segment(self, src_video: str, dst_video: str,
+                               start_sec: float, duration_sec: float) -> bool:
+        """调用 ffmpeg，从原始视频中截取一段原始分辨率视频。"""
+        ffmpeg_path = utils.get_ffmpeg_path()
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-ss", f"{start_sec:.3f}",
+            "-i", src_video,
+            "-t", f"{duration_sec:.3f}",
+            "-c", "copy",          # 直接拷贝，不重编码
+            dst_video,
+        ]
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except Exception as e:
+            print("[Feedback] ffmpeg extract error:", e)
+            return False
+
+    def _iter_log_files(self):
+        """遍历 AppData 下的日志文件路径。"""
+        paths = []
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return paths
+
+        # 示例路径：%APPDATA%\AirSteady\.sys\logs
+        log_root = os.path.join(appdata, "AirSteady", ".sys", "logs")
+        if not os.path.isdir(log_root):
+            return paths
+
+        for root, _dirs, files in os.walk(log_root):
+            for name in files:
+                full = os.path.join(root, name)
+                paths.append(full)
+        return paths
+
+    def closeEvent(self, event):
+        # 释放预览 VideoCapture
+        if self.cap_raw is not None:
+            self.cap_raw.release()
+            self.cap_raw = None
+        if self.cap_steady is not None:
+            self.cap_steady.release()
+            self.cap_steady = None
+        super().closeEvent(event)
+
+
 if __name__ == "__main__":
     main()
+
+
