@@ -5,6 +5,7 @@ import time
 import subprocess  # ⭐ 新增：用于调用 ffmpeg
 import shutil
 import zipfile
+import logging
 
 import cv2
 import numpy as np
@@ -41,8 +42,10 @@ from PySide6.QtCore import QUrl
 from algorithm import TrackEngine  # 你的算法文件
 import algorithm
 import utils
-#
 
+
+# 全局 logger，所有模块统一使用这个名字
+logger = logging.getLogger("airsteady")
 
 class AppState(Enum):
     IDLE = auto()
@@ -1672,6 +1675,9 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    utils.init_logging()
+    logger.info("AirSteady application starting.")
+
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
@@ -1962,12 +1968,8 @@ class FeedbackDialog(QDialog):
     def _iter_log_files(self):
         """遍历 AppData 下的日志文件路径。"""
         paths = []
-        appdata = os.environ.get("APPDATA")
-        if not appdata:
-            return paths
 
-        # 示例路径：%APPDATA%\AirSteady\.sys\logs
-        log_root = os.path.join(appdata, "AirSteady", ".sys", "logs")
+        log_root = utils.get_airsteady_log_dir()
         if not os.path.isdir(log_root):
             return paths
 

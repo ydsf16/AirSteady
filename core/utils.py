@@ -3,12 +3,13 @@ import sys
 import tempfile
 from uuid import uuid4
 from pathlib import Path
-import sys
+import logging
+
 
 def get_airsteady_cache_dir() -> str:
     """
     返回 AirSteady 的缓存目录路径（按平台放到系统推荐的 cache 位置）。
-    - Windows:  %LOCALAPPDATA%\\AirSteady\\cache
+    - Windows:  %LOCALAPPDATA%\AirSteady\cache
     - macOS:    ~/Library/Caches/AirSteady
     - Linux:    ~/.cache/airsteady 或 $XDG_CACHE_HOME/airsteady
     """
@@ -87,3 +88,62 @@ def get_ffmpeg_path() -> str:
 
     # 3) 最后兜底：假设系统 PATH 有 ffmpeg（开发机上一般有）
     return "ffmpeg"
+
+
+# ====================== 日志相关工具 ======================
+
+def get_airsteady_log_dir() -> str:
+    """
+    返回 AirSteady 的缓存目录路径（按平台放到系统推荐的 logs 位置）。
+    - Windows:  %LOCALAPPDATA%\AirSteady\logs
+    - macOS:    ~/Library/Logss/AirSteady
+    - Linux:    ~/.logs/airsteady 或 $XDG_LOGS_HOME/airsteady
+    """
+    if sys.platform.startswith("win"):
+        base = os.getenv("LOCALAPPDATA", tempfile.gettempdir())
+        logs_dir = os.path.join(base, "AirSteady", "logs")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Logss")
+        logs_dir = os.path.join(base, "AirSteady")
+    else:
+        # Linux / Unix
+        base = os.getenv("XDG_LOGS_HOME", os.path.expanduser("~/.logs"))
+        logs_dir = os.path.join(base, "airsteady")
+
+    os.makedirs(logs_dir, exist_ok=True)
+    return logs_dir
+
+
+def init_logging(logger_name: str = "airsteady") -> logging.Logger:
+    """
+    初始化 AirSteady 的日志系统：
+    - 每次启动都覆盖同一个 log 文件（只保留本次运行的日志）；
+    - 日志会写入文件，方便“问题反馈”里打包；
+    - 不改变现有 print 行为（print 仍然按原样输出到控制台）。
+
+    调用多次是安全的（只会初始化一次）。
+    """
+    logger = logging.getLogger(logger_name)
+
+    # 已经初始化过就复用
+    if getattr(logger, "_airsteady_inited", False):
+        return logger
+
+    logger.setLevel(logging.INFO)
+
+    log_dir = get_airsteady_log_dir()
+    log_path = os.path.join(log_dir, "airsteady.log")
+
+    # 每次运行覆盖写入，保证“循环记录，只保留当次”
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # 标记一下，避免重复配置
+    logger._airsteady_inited = True  # type: ignore[attr-defined]
+
+    return logger
