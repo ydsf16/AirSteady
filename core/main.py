@@ -2,6 +2,7 @@ import sys
 from enum import Enum, auto
 import os
 import time
+import subprocess  # ⭐ 新增：用于调用 ffmpeg
 
 import cv2
 import numpy as np
@@ -59,7 +60,9 @@ class VideoView(QWidget):
         self._title = title
         self._pixmap: QPixmap | None = None
         self._overlay_text: str | None = None
+        self._warn_overlay_text: str | None = None
         self._overlay_color = QColor(255, 255, 255)
+        self._warn_overlay_color = QColor(255, 255, 255)
         self._overlay_bg = QColor(0, 0, 0, 120)
         self._target_rect: QRectF | None = None  # 0~1 归一化坐标
         self._last_draw_rect = QRectF()
@@ -78,9 +81,19 @@ class VideoView(QWidget):
         if center is not None:
             self._overlay_center = center
         self.update()
+    
+    def set_warn_overlay(self, text: str | None, color: QColor | None = None):
+        self._warn_overlay_text = text
+        if color is not None:
+            self._warn_overlay_color = color
+        self.update()
 
     def clear_overlay(self):
         self._overlay_text = None
+        self.update()
+    
+    def clear_warn_overlay(self):
+        self._warn_overlay_text = None
         self.update()
 
     def set_target_rect_norm(self, rect_norm: QRectF | None):
@@ -159,6 +172,30 @@ class VideoView(QWidget):
                 bg_rect,
                 Qt.AlignCenter | Qt.AlignVCenter,
                 self._overlay_text,
+            )
+
+        if self._warn_overlay_text:
+            painter.setFont(QFont("Microsoft YaHei", 11))
+            metrics = painter.fontMetrics()
+            text_width = metrics.horizontalAdvance(self._warn_overlay_text)
+            text_height = metrics.height()
+
+            # 居中放在 content_rect 中间
+            tx = content_rect.center().x() - text_width / 2
+            ty = content_rect.center().y() - text_height / 2
+
+            bg_rect = QRectF(
+                tx - 10,
+                ty - text_height,
+                text_width + 20,
+                text_height + 40,
+            )
+            painter.fillRect(bg_rect, self._overlay_bg)
+            painter.setPen(self._warn_overlay_color)
+            painter.drawText(
+                bg_rect,
+                Qt.AlignCenter | Qt.AlignVCenter,
+                self._warn_overlay_text,
             )
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -309,12 +346,12 @@ class ExportDialog(QDialog):
         )
 
         # 推荐分辨率（同纵横比，且不超过原片）
-        rec_sizes = self._make_recommended_resolutions(src_w, src_h)
-        for w, h in rec_sizes:
-            self.resolution_combo.addItem(
-                f"推荐：{w} x {h}",
-                ("fixed", w, h),
-            )
+        # rec_sizes = self._make_recommended_resolutions(src_w, src_h)
+        # for w, h in rec_sizes:
+        #     self.resolution_combo.addItem(
+        #         f"推荐：{w} x {h}",
+        #         ("fixed", w, h),
+        #     )
 
         res_label = QLabel("导出分辨率：")
 
@@ -462,6 +499,74 @@ class TrackEngineInitWorker(QObject):
             self.error.emit(str(e))
 
 
+class PlanAndPreviewWorker(QObject):
+    """
+    后台线程执行：
+    1) 轨迹规划 planning_crop_traj
+    2) 预览小视频导出 export_stabilized_video
+    """
+    finished = Signal(object, str)   # (crop_traj, preview_steady_path)
+    error = Signal(str)
+    progress = Signal(float)
+
+    def __init__(
+        self,
+        track_result,
+        img_width: int,
+        img_height: int,
+        max_crop_ratio: float,
+        smooth_factor: float,
+        input_video_path: str,
+        output_video_path: str,
+        work_width: int,
+        work_height: int,
+        parent=None,   # 这里保持不变，下面调用的时候会传 parent=self
+    ):
+        super().__init__(parent)
+        self._track_result = track_result
+        self._img_width = int(img_width)
+        self._img_height = int(img_height)
+        self._max_crop_ratio = float(max_crop_ratio)
+        self._smooth_factor = float(smooth_factor)
+        self._input_video_path = input_video_path
+        self._output_video_path = output_video_path
+        self._work_width = int(work_width)
+        self._work_height = int(work_height)
+
+    @Slot()
+    def run(self):
+        try:
+            # STEP1: 轨迹规划（纯算法，不碰 UI）
+            crop_traj = algorithm.planning_crop_traj(
+                track_result=self._track_result,
+                img_width=self._img_width,
+                img_height=self._img_height,
+                max_crop_ratio=self._max_crop_ratio,
+                smooth_factor=self._smooth_factor,
+                debug=False,
+            )
+
+            # STEP2: 根据裁切结果导出预览用的小视频
+            def _cb(p):
+                try:
+                    self.progress.emit(float(p))
+                except Exception:
+                    pass
+
+            algorithm.export_stabilized_video(
+                input_video_path=self._input_video_path,
+                crop_frames=crop_traj,
+                output_video_path=self._output_video_path,
+                work_width=self._work_width,
+                work_height=self._work_height,
+                progress_cb=_cb,
+            )
+
+            self.finished.emit(crop_traj, self._output_video_path)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -491,6 +596,11 @@ class MainWindow(QMainWindow):
         # 结果缓存
         self.track_engine: TrackEngine | None = None
         self._track_engine_thread: QThread | None = None
+
+         # ⭐ 新增：规划 & 预览后台线程
+        self._plan_thread: QThread | None = None
+        self._plan_worker: PlanAndPreviewWorker | None = None
+
         self.track_result_all = None
         self.crop_traj = None
         self.preview_raw_path = ""
@@ -506,6 +616,60 @@ class MainWindow(QMainWindow):
         self._start_track_engine_init()
 
         self.warn_visible_until = 0.0
+    
+    def _mux_audio_from_source(self, src_video: str, dst_video: str):
+        """
+        使用内置 ffmpeg 将原始视频的音频轨道拷贝到稳像后的视频中。
+        - src_video: 原始带音频的视频路径
+        - dst_video: 稳像后（当前是无音频）的 mp4 文件路径
+        """
+        if (not os.path.exists(src_video)) or (not os.path.exists(dst_video)):
+            return
+
+        ffmpeg_path = utils.get_ffmpeg_path()  # ⭐ 关键：拿到内置 ffmpeg 绝对路径
+
+        # 临时输出文件，成功后再覆盖原文件
+        tmp_out = dst_video + ".tmp_mux.mp4"
+
+        cmd = [
+            ffmpeg_path,
+            "-y",               # 覆盖输出
+            "-i", dst_video,    # 输入0：稳像后的视频（只要其中的视频流）
+            "-i", src_video,    # 输入1：原始视频（只要其中的音频流）
+            "-c:v", "copy",     # 视频直接拷贝，不重新编码
+            "-map", "0:v:0",    # 只要第0个输入的第一个视频流
+            "-map", "1:a:0?",   # 尝试取第1个输入的第一个音频流（? 表示没有也不报错）
+            "-c:a", "aac",      # 音频编码为 AAC
+            "-shortest",        # 以较短的音视频长度为准
+            tmp_out,
+        ]
+
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            print("[AudioMux] failed to mux audio:", e)
+            if os.path.exists(tmp_out):
+                try:
+                    os.remove(tmp_out)
+                except OSError:
+                    pass
+            return
+
+        # 成功则替换掉原来的无声视频
+        try:
+            os.replace(tmp_out, dst_video)
+        except OSError as e:
+            print("[AudioMux] failed to replace dst video:", e)
+            if os.path.exists(tmp_out):
+                try:
+                    os.remove(tmp_out)
+                except OSError:
+                    pass
 
     # --------- 全局键盘拦截，空格控制预览播放 ----------
     def eventFilter(self, obj, event):
@@ -548,6 +712,7 @@ class MainWindow(QMainWindow):
         self.track_engine = engine
         self.raw_view.clear_overlay()
         self.steady_view.clear_overlay()
+        self.steady_view.clear_warn_overlay()
         self.status.clearMessage()
         self._update_state(AppState.IDLE)
         self.open_btn.setEnabled(True)
@@ -660,6 +825,7 @@ class MainWindow(QMainWindow):
         self.steady_view.set_frame_pixmap(None)
         self.raw_view.clear_overlay()
         self.steady_view.clear_overlay()
+        self.steady_view.clear_warn_overlay()
 
         self.timeline_slider.blockSignals(True)
         self.timeline_slider.setRange(0, 0)
@@ -692,8 +858,9 @@ class MainWindow(QMainWindow):
             self.control_panel.track_class_combo.setEnabled(False)
             self.control_panel.recompute.setEnabled(False)
 
-            self.raw_view.set_overlay("跟踪中...\n跟踪完成后将自动规划运镜", center=False)
+            self.raw_view.set_overlay("跟踪中...\n完成后将自动运镜", center=False)
             self.steady_view.clear_overlay()
+            self.steady_view.clear_warn_overlay()
             self.status.showMessage("跟踪中...")
 
         elif new_state == AppState.TRACK_DONE:
@@ -722,7 +889,18 @@ class MainWindow(QMainWindow):
             self.play_btn.setText("▶")
             self.control_panel.recompute.setEnabled(True)
 
-            self.raw_view.set_overlay("稳像完成，可播放预览效果\n如效果不佳，建议减少裁切保留比例+强力稳像", center=False, color=QColor(255, 200, 200))
+            self.raw_view.set_overlay(
+                "稳像完成，可播放预览效果\n如效果不佳，建议减少裁切保留比例+强力稳像",
+                center=False,
+                color=QColor(255, 200, 200),
+            )
+
+            self.steady_view.set_overlay(
+                "稳像完成，可播放预览效果\n如效果不佳，建议减少裁切保留比例+强力稳像",
+                center=False,
+                color=QColor(255, 200, 200),
+            )
+
             self.status.showMessage("稳像完成，可播放预览效果")
 
         elif new_state == AppState.EXPORTING:
@@ -734,7 +912,7 @@ class MainWindow(QMainWindow):
             self.control_panel.recompute.setEnabled(False)
             self.steady_view.set_overlay("正在导出稳像视频...", center=True, color=QColor(220, 220, 255))
             self.status.showMessage("正在导出稳像视频...")
-            # self.export_progress.setVisible(True)
+            self.export_progress.setVisible(False)
             self.export_progress.setValue(0)
 
     # ---------------- 控件回调 ----------------
@@ -845,7 +1023,7 @@ class MainWindow(QMainWindow):
         if not out_path:
             return
 
-        # 真正执行导出
+        # 真正执行导出（这个函数还是在主线程里，但内部有进度回调 + processEvents）
         self._do_export_video(out_path, mode, target_w, target_h)
 
     def _on_play_pause_clicked(self):
@@ -889,6 +1067,82 @@ class MainWindow(QMainWindow):
         # 裁切保留比例 slider 改变时，先不立即重算
         print(f"[UI] 裁切保留比例更新: {keep_ratio:.2f}")
 
+    def _start_plan_and_preview(self, smooth_factor: float, max_crop_ratio: float):
+        """
+        启动后台线程做：轨迹规划 + 预览小视频导出。
+        """
+        if not self.track_engine or not self.track_result_all:
+            return
+
+        # 更新状态到 PLANNING，给用户提示
+        self._update_state(AppState.PLANNING)
+
+        # 预览用路径
+        self.preview_raw_path = self.track_engine.tmp_video_path
+        self.preview_steady_path = os.path.join(utils.get_airsteady_cache_dir(), "tmp_crop.mp4")
+
+        # 如果之前有老的线程，理论上已经 quit + deleteLater 了，这里简单覆盖即可
+        self._plan_thread = QThread(self)
+
+        # ⭐ 把 worker 挂在 self 上，并指定 parent=self，防止被 GC
+        self._plan_worker = PlanAndPreviewWorker(
+            track_result=self.track_result_all,
+            img_width=self.track_engine.scale_width,
+            img_height=self.track_engine.scale_height,
+            max_crop_ratio=max_crop_ratio,
+            smooth_factor=smooth_factor,
+            input_video_path=self.preview_raw_path,
+            output_video_path=self.preview_steady_path,
+            work_width=self.track_engine.scale_width,
+            work_height=self.track_engine.scale_height,
+            parent=self,   # ⭐ 关键：让 Qt 管理生命周期
+        )
+        self._plan_worker.moveToThread(self._plan_thread)
+
+        # 线程启动 -> worker.run
+        self._plan_thread.started.connect(self._plan_worker.run)
+
+        # 进度发回主线程，复用预览导出的进度文本
+        self._plan_worker.progress.connect(self._on_export_progress)
+
+        # 规划+导出成功
+        self._plan_worker.finished.connect(self._on_plan_preview_finished)
+        self._plan_worker.finished.connect(self._plan_worker.deleteLater)
+        self._plan_worker.finished.connect(self._plan_thread.quit)
+
+        # 出错
+        self._plan_worker.error.connect(self._on_plan_preview_error)
+        self._plan_worker.error.connect(self._plan_worker.deleteLater)
+        self._plan_worker.error.connect(self._plan_thread.quit)
+
+        self._plan_thread.finished.connect(self._plan_thread.deleteLater)
+
+        self._plan_thread.start()
+
+    def _on_plan_preview_finished(self, crop_traj, steady_path: str):
+        """
+        后台线程规划 + 预览导出完成，回到主线程。
+        """
+        print("[PlanAndPreview] finished, steady_path =", steady_path)
+
+        self.crop_traj = crop_traj
+        self.preview_steady_path = steady_path
+
+        # 初始化预览播放器
+        self._init_preview_player()
+        # 更新状态为 PLAN_DONE
+        self._update_state(AppState.PLAN_DONE)
+
+    def _on_plan_preview_error(self, msg: str):
+        """
+        后台规划/预览失败。
+        """
+        print("[PlanAndPreview] error:", msg)
+        self.status.showMessage(f"规划/预览生成失败: {msg}")
+        QMessageBox.warning(self, "运镜失败", f"规划运镜或生成预览失败：\n{msg}")
+        # 回到 TRACK_DONE 状态，让用户可以调整参数后重试
+        self._update_state(AppState.TRACK_DONE)
+
     def _on_recompute_clicked(self):
         """PLAN_DONE 状态下，使用当前 slider 参数重新规划 + 重新导出 + 回到预览。"""
         if self.state != AppState.PLAN_DONE:
@@ -897,9 +1151,12 @@ class MainWindow(QMainWindow):
             return
 
         print("[Recompute] 重新运镜")
-        self.state = AppState.TRACK_DONE
+
+        # 停掉当前预览播放器，释放 tmp_video 句柄
+        self._reset_preview_player()
         self.raw_view.clear_overlay()
         self.steady_view.clear_overlay()
+        self.steady_view.clear_warn_overlay()
         self.export_btn.setEnabled(False)
         self.prev_btn.setEnabled(False)
         self.play_btn.setEnabled(False)
@@ -913,33 +1170,13 @@ class MainWindow(QMainWindow):
         # keep_ratio = 1.0 -> max_crop_ratio = 0.0 (不裁切)
         max_crop_ratio = float(np.clip(1.0 - keep_ratio, 0.0, 0.6))
 
-        print(f"[Recompute] smooth_factor={smooth_factor:.3f}, keep_ratio={keep_ratio:.3f}, max_crop_ratio={max_crop_ratio:.3f}")
-
-        self._update_state(AppState.PLANNING)
-
-        # 重新规划轨迹
-        self.crop_traj = algorithm.planning_crop_traj(
-            track_result=self.track_result_all,
-            img_width=self.track_engine.scale_width,
-            img_height=self.track_engine.scale_height,
-            max_crop_ratio=max_crop_ratio,
-            smooth_factor=smooth_factor,
-            debug=False,
+        print(
+            f"[Recompute] smooth_factor={smooth_factor:.3f}, "
+            f"keep_ratio={keep_ratio:.3f}, max_crop_ratio={max_crop_ratio:.3f}"
         )
 
-        # 重新导出预览小视频
-        algorithm.export_stabilized_video(
-            input_video_path=self.preview_raw_path,
-            crop_frames=self.crop_traj,
-            output_video_path=self.preview_steady_path,
-            work_width=self.track_engine.scale_width,
-            work_height=self.track_engine.scale_height,
-            progress_cb=self._on_export_progress,
-        )
-
-        # 重新打开预览播放器
-        self._init_preview_player()
-        self._update_state(AppState.PLAN_DONE)
+        # 后台重新规划 + 生成预览
+        self._start_plan_and_preview(smooth_factor, max_crop_ratio)
 
     def _on_raw_view_clicked(self, x_norm: float, y_norm: float):
         print("_on_raw_view_clicked", x_norm, y_norm)
@@ -948,8 +1185,9 @@ class MainWindow(QMainWindow):
 
     def _on_export_progress(self, percent: float):
         # 预览导出时用的进度（小视频），不走进度条，只在状态栏/overlay 里提示
-        self.status.showMessage(f"正在导出稳像预览视频... {percent:.1f}%")
-        self.steady_view.set_overlay(f"正在导出稳像预览视频... {percent:.1f}%", center=False)
+        p = float(percent)
+        self.status.showMessage(f"正在导出稳像预览视频... {p:.1f}%")
+        self.steady_view.set_overlay(f"正在导出稳像预览视频... {p:.1f}%", center=False)
 
     def _on_final_export_progress(self, percent: float):
         """
@@ -1059,20 +1297,17 @@ class MainWindow(QMainWindow):
                 cap.release()
                 writer.release()
 
+            # Copy video.
+            self._mux_audio_from_source(src_video, out_path)
+
             self._on_final_export_progress(100.0)
             self.status.showMessage(f"导出完成: {out_path}")
             QMessageBox.information(self, "导出完成", f"稳像视频已导出：\n{out_path}")
-            
-            # 重新支持重算轨迹
-            self._update_state(AppState.PLAN_DONE)
-            self.open_btn.setEnabled(True)
-            self.export_btn.setEnabled(True)
-            self.control_panel.recompute.setEnabled(True)
-            self.steady_view.clear_overlay()
-
+        
         except Exception as e:
             self.status.showMessage(f"导出失败: {e}")
             QMessageBox.warning(self, "导出失败", f"导出失败：{e}")
+
         finally:
             # 隐藏进度条，清理临时文件
             self.export_progress.setVisible(False)
@@ -1081,6 +1316,15 @@ class MainWindow(QMainWindow):
                     os.remove(tmp_auto_path)
                 except OSError:
                     pass
+            
+            # 重新支持重算轨迹
+            self._update_state(AppState.PLAN_DONE)
+            self.open_btn.setEnabled(True)
+            self.export_btn.setEnabled(True)
+            self.control_panel.recompute.setEnabled(True)
+            self.raw_view.clear_overlay()
+            self.steady_view.clear_overlay()
+            self.steady_view.clear_warn_overlay()
 
     # ---------------- 跟踪阶段：逐帧调用 TrackEngine ----------------
     def _on_track_obj(self):
@@ -1106,38 +1350,13 @@ class MainWindow(QMainWindow):
             smooth_factor = float(np.clip(1.0 - smooth_ui, 0.0, 1.0))
             max_crop_ratio = float(np.clip(1.0 - keep_ratio, 0.0, 0.6))
 
-            print(f"smooth_factor = {smooth_factor:.3f} keep_ratio = {keep_ratio:.3f} max_crop_ratio = {max_crop_ratio:.3f}")
-
-            # 进入 PLANNING 状态（UI 显示“正在规划运镜...”）
-            self._update_state(AppState.PLANNING)
-
-            # 轨迹规划
-            self.crop_traj = algorithm.planning_crop_traj(
-                track_result=self.track_result_all,
-                img_width=self.track_engine.scale_width,
-                img_height=self.track_engine.scale_height,
-                max_crop_ratio=max_crop_ratio,
-                smooth_factor=smooth_factor,
-                debug=False,
+            print(
+                f"smooth_factor = {smooth_factor:.3f} "
+                f"keep_ratio = {keep_ratio:.3f} max_crop_ratio = {max_crop_ratio:.3f}"
             )
 
-            # 根据裁切结果，生成预览用的小视频
-            self.preview_raw_path = self.track_engine.tmp_video_path
-            self.preview_steady_path = os.path.join(utils.get_airsteady_cache_dir(), "tmp_crop.mp4")
-
-            algorithm.export_stabilized_video(
-                input_video_path=self.preview_raw_path,
-                crop_frames=self.crop_traj,
-                output_video_path=self.preview_steady_path,
-                work_width=self.track_engine.scale_width,
-                work_height=self.track_engine.scale_height,
-                progress_cb=self._on_export_progress,  # 更新状态栏/overlay
-            )
-
-            # 初始化预览播放器
-            self._init_preview_player()
-            # 规划 + 导出完成
-            self._update_state(AppState.PLAN_DONE)
+            # 后台执行：轨迹规划 + 预览视频导出
+            self._start_plan_and_preview(smooth_factor, max_crop_ratio)
             return
 
         # === 2) 跟踪过程 ===
@@ -1215,20 +1434,18 @@ class MainWindow(QMainWindow):
                 show_warn = True
 
         if show_warn:
-            # 有 clamp：立刻显示，并把“允许清理时间”往后推 2 秒
-            self.steady_view.set_overlay(
+            # 有 clamp：立刻显示，并把“允许清理时间”往后推一点
+            self.steady_view.set_warn_overlay(
                 warn_text,
-                center=True,
                 color=QColor(255, 200, 200),
             )
-            # 至少再保留 2 秒
+            # 至少再保留 1 秒
             self.warn_visible_until = now + 1.0
         else:
             # 没有 clamp：如果当前时间已经超过“允许清理时间”，才真正清理
             if now >= self.warn_visible_until:
-                self.steady_view.clear_overlay()
+                self.steady_view.clear_warn_overlay()
             # 否则啥也不做，让文字继续停留
-
 
     def _on_preview_tick(self):
         """预览计时器回调：同步播放原始 & 稳像小视频。"""

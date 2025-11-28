@@ -3,6 +3,13 @@ import sys
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
+import sys
+from enum import Enum, auto
+import os
+import time
+import subprocess  # ⭐ 新增：用于调用 ffmpeg
+
+
 import cv2
 import numpy as np
 import torch
@@ -85,8 +92,8 @@ class TrackEngine:
         self.names = self.model.names  # dict: {0: 'person', 1: 'bicycle', ...}
 
         # 预览时限制最大尺寸
-        self.max_width = 600
-        self.max_height = 600
+        self.max_width = 2040
+        self.max_height = 2040
 
         # 跟踪结果（完整轨迹）
         self.track_results: List[TrackFrame] = []
