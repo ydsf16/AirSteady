@@ -837,7 +837,7 @@ class MainWindow(QMainWindow):
         self.export_btn = QPushButton("导出视频")
         self.readme_btn = QPushButton("使用说明")
         self.feedback_btn = QPushButton("问题反馈")
-        self.author_bth = QPushButton("联系我们")
+        self.author_bth = QPushButton("关于作者")
         self.file_label = QLabel("未加载视频")
 
         top_bar = QWidget()
@@ -904,6 +904,8 @@ class MainWindow(QMainWindow):
         self.play_btn.clicked.connect(self._on_play_pause_clicked)
         self.prev_btn.clicked.connect(self._on_prev_clicked)
         self.timeline_slider.sliderReleased.connect(self._on_timeline_released)
+        self.readme_btn.clicked.connect(self._on_readme_clicked)  # ⭐ 新增这一行
+        self.author_bth.clicked.connect(self._on_contact_clicked)
 
         self.control_panel.smoothChanged.connect(self._on_smooth_changed)
         self.control_panel.cropChanged.connect(self._on_crop_changed)
@@ -917,6 +919,15 @@ class MainWindow(QMainWindow):
         # ⭐ 新增：问题反馈
         self.feedback_btn.clicked.connect(self._on_feedback_clicked)
     
+    def _on_contact_clicked(self):
+        dlg = ContactDialog(self)
+        dlg.exec()
+        
+    def _on_readme_clicked(self):
+        """打开使用说明对话框。"""
+        dlg = ReadmeDialog(self)
+        dlg.exec()
+        
     def _on_preview_view_clicked(self, x_norm: float, y_norm: float):
         """预览阶段点击画面：切换播放/暂停。"""
         if self.state == AppState.PLAN_DONE and self.preview_cap_raw and self.preview_cap_raw.isOpened():
@@ -1988,6 +1999,225 @@ class FeedbackDialog(QDialog):
             self.cap_steady.release()
             self.cap_steady = None
         super().closeEvent(event)
+
+class ReadmeDialog(QDialog):
+    """AirSteady 使用说明对话框。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("使用说明")
+        self.resize(640, 420)
+
+        layout = QVBoxLayout(self)
+
+        # 标题
+        title = QLabel("AirSteady 使用说明")
+        title_font = title.font()
+        title_font.setPointSize(title_font.pointSize() + 2)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        layout.addSpacing(10)
+
+        # 功能简介
+        intro = QLabel(
+            "欢迎使用 AirSteady！\n\n"
+            "AirSteady 可以帮助你把抖动的航空视频稳定住，让画面始终盯住飞机。\n"
+            "系统会在后台自动完成目标跟踪和运镜规划，通过逐帧裁切生成一段始终跟随飞机的新视频，"
+            "从而达到显著的稳像效果。"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        layout.addSpacing(10)
+
+        # 使用流程
+        usage = QLabel(
+            "<b>使用流程：</b><br>"
+            "1. 点击左上角「打开视频」，选择你要处理的航空视频；<br>"
+            "2. 打开后，程序会自动开始跟踪飞机并规划全局运镜路径，无需额外操作；<br>"
+            "3. 处理完成后，可以在左右两个窗口中预览原始视频与稳像结果；<br>"
+            "4. 如果预览效果不满意，可以在右侧「参数调节」中调整平滑度、裁切保留比例，"
+            "然后点击「重新运镜」，重新生成预览视频；<br>"
+            "5. 预览满意后，点击「导出视频」，即可导出全分辨率的稳像视频。"
+        )
+        usage.setWordWrap(True)
+        layout.addWidget(usage)
+
+        layout.addSpacing(10)
+
+        # 问题反馈说明
+        feedback = QLabel(
+            "<b>问题反馈：</b><br>"
+            "如果使用过程中遇到问题，可以点击主界面右上角的「问题反馈」按钮，"
+            "按照界面提示截取出现问题的视频片段，并自动打包日志与设备信息。<br>"
+            "打包完成后，请根据弹出的飞书问卷链接上传压缩包，并简要描述遇到的问题，"
+            "以便我们更快地分析和修复。"
+        )
+        feedback.setWordWrap(True)
+        layout.addWidget(feedback)
+
+        layout.addSpacing(10)
+
+        # 可点击的产品说明文档链接（记得替换成你自己的链接）
+        link = QLabel(
+            '详细产品说明文档（持续更新）：<br>'
+            '<a href="https://ai.feishu.cn/wiki/VVsDwawHxiaOIlkvOFMce7fvnhe">https://ai.feishu.cn/wiki/VVsDwawHxiaOIlkvOFMce7fvnhe</a>'
+        )
+        link.setOpenExternalLinks(True)
+        link.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        link.setWordWrap(True)
+        layout.addWidget(link)
+
+        layout.addStretch(1)
+
+        # 底部关闭按钮
+        btn_box = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_box.rejected.connect(self.reject)
+        btn_box.accepted.connect(self.accept)
+        layout.addWidget(btn_box)
+
+
+class ContactDialog(QDialog):
+    """关于作者 / 联系我们 对话框。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("联系我们")
+        self.resize(680, 480)
+
+        layout = QVBoxLayout(self)
+
+        # 标题
+        title = QLabel("关于作者")
+        title_font = title.font()
+        title_font.setPointSize(title_font.pointSize() + 2)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        layout.addSpacing(10)
+
+        # 文本介绍
+        intro = QLabel(
+            "<b>关于作者</b><br>"
+            "我是 AirSteady 的作者小葡萄爸爸，一名长期从事机器人、计算机视觉等方向的研发工程师。<br>"
+            "平时喜欢把复杂技术做成真正好用的小工具，AirSteady 就是把技术和个人兴趣结合的一次尝试。<br><br>"
+
+            "<b>关于航空与兴趣爱好</b><br>"
+            "我是一名资深航空迷，曾多次前往各类航展现场，"
+            "也是多年的航模玩家（电动、油动都玩过）。<br>"
+            "平时喜欢旅游和音乐，闲下来的时候会自己打架子鼓放松。<br><br>"
+
+            "<b>更多了解与联系</b><br>"
+            "欢迎通过下面的渠道和我交流技术、产品想法，或者单纯聊聊飞机和旅行：<br>"
+            "• 知乎（技术文章）："
+            '<a href="https://www.zhihu.com/people/DongShengYang/posts/posts_by_votes">'
+            "https://www.zhihu.com/people/DongShengYang/posts/posts_by_votes</a><br>"
+            "• GitHub（开源代码）："
+            '<a href="https://github.com/ydsf16">'
+            "https://github.com/ydsf16</a><br>"
+        )
+        intro.setWordWrap(True)
+        intro.setOpenExternalLinks(True)
+        intro.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        layout.addWidget(intro)
+
+        layout.addSpacing(10)
+
+        # ===== 抖音 & 微信二维码区域 =====
+        qr_row = QHBoxLayout()
+
+        # 居中两列
+        qr_row.addStretch(1)
+
+        # 抖音列
+        douyin_col = QVBoxLayout()
+        douyin_title = QLabel("抖音")
+        douyin_title.setAlignment(Qt.AlignCenter)
+        douyin_label = QLabel()
+        douyin_label.setAlignment(Qt.AlignCenter)
+
+        douyin_qr = self._load_qr_pixmap("assets/douyin_qr.jpg")
+        if douyin_qr is not None:
+            douyin_label.setPixmap(douyin_qr)
+        else:
+            douyin_label.setText("请在 assets/douyin_qr.png 放置抖音二维码")
+            douyin_label.setWordWrap(True)
+
+        douyin_hint = QLabel("扫描二维码\n关注抖音账号")
+        douyin_hint.setAlignment(Qt.AlignCenter)
+        douyin_hint.setWordWrap(True)
+
+        douyin_col.addWidget(douyin_title)
+        douyin_col.addWidget(douyin_label)
+        douyin_col.addWidget(douyin_hint)
+
+        # 微信列
+        wechat_col = QVBoxLayout()
+        wechat_title = QLabel("微信")
+        wechat_title.setAlignment(Qt.AlignCenter)
+        wechat_label = QLabel()
+        wechat_label.setAlignment(Qt.AlignCenter)
+
+        wechat_qr = self._load_qr_pixmap("assets/wechat_qr.jpg")
+        if wechat_qr is not None:
+            wechat_label.setPixmap(wechat_qr)
+        else:
+            wechat_label.setText("请在 assets/wechat_qr.png 放置微信二维码")
+            wechat_label.setWordWrap(True)
+
+        wechat_hint = QLabel("扫描二维码\n添加微信好友（备注 “AirSteady”）")
+        wechat_hint.setAlignment(Qt.AlignCenter)
+        wechat_hint.setWordWrap(True)
+
+        wechat_col.addWidget(wechat_title)
+        wechat_col.addWidget(wechat_label)
+        wechat_col.addWidget(wechat_hint)
+
+        # 把两列加到一行里
+        qr_row.addLayout(douyin_col)
+        qr_row.addSpacing(40)
+        qr_row.addLayout(wechat_col)
+
+        qr_row.addStretch(1)
+
+        layout.addLayout(qr_row)
+
+        layout.addStretch(1)
+
+        # 底部关闭按钮
+        btn_box = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_box.rejected.connect(self.reject)
+        btn_box.accepted.connect(self.accept)
+        layout.addWidget(btn_box)
+
+    def _load_qr_pixmap(self, relative_path: str) -> QPixmap | None:
+        """
+        从相对路径加载二维码图片，并缩放到合适大小。
+        relative_path: 相对于 main.py 所在目录，比如 'assets/douyin_qr.png'
+        """
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        full_path = os.path.join(base_dir, relative_path)
+
+        print(full_path)
+
+        pix = QPixmap(full_path)
+        if pix.isNull():
+            return None
+
+        # 缩放到 180x180 左右，保持纵横比
+        size = 180
+        scaled = pix.scaled(
+            size,
+            size,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation,
+        )
+        return scaled
 
 
 if __name__ == "__main__":
