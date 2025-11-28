@@ -1,9 +1,10 @@
 import sys
 from enum import Enum, auto
+import os
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QRectF, Signal
+from PySide6.QtCore import Qt, QTimer, QRectF, Signal, QThread, QObject, Slot
 from PySide6.QtGui import QPainter, QColor, QFont, QPixmap, QMouseEvent, QImage
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,17 +25,19 @@ from PySide6.QtWidgets import (
     QComboBox,
 )
 
-from algorithm import AirSteadyEngine
+from algorithm import TrackEngine
+import algorithm
+import utils
 
 
 class AppState(Enum):
-    IDLE = auto()                # 没有加载视频
-    LOADED_NO_TARGET = auto()    # 已加载视频，但未选目标
-    READY = auto()               # 已选目标，可以播放
-    PLAYING = auto()             # 正在播放+跟踪
-    LOST = auto()                # 目标丢失，等待用户重新点击
-    EXPORTING = auto()           # 正在导出视频
-
+    IDLE = auto()
+    VIDEO_LOADED = auto()
+    TRACKING = auto()
+    TRACK_DONE = auto()
+    PLANNING = auto()
+    PLAN_DONE = auto()
+    EXPORTING = auto()
 
 class VideoView(QWidget):
     """
@@ -55,6 +58,7 @@ class VideoView(QWidget):
         self._overlay_bg = QColor(0, 0, 0, 120)
         self._target_rect: QRectF | None = None  # 0~1 归一化坐标
         self._last_draw_rect = QRectF()
+        self._overlay_center = True
 
         self.setMinimumSize(320, 240)
 
@@ -62,10 +66,12 @@ class VideoView(QWidget):
         self._pixmap = pix
         self.update()
 
-    def set_overlay(self, text: str | None, color: QColor | None = None):
+    def set_overlay(self, text: str | None, center: bool | None, color: QColor | None = None):
         self._overlay_text = text
         if color is not None:
             self._overlay_color = color
+        if center is not None:
+            self._overlay_center = center
         self.update()
 
     def clear_overlay(self):
@@ -131,13 +137,16 @@ class VideoView(QWidget):
 
             # 居中放在 content_rect 中间
             tx = content_rect.center().x() - text_width / 2
-            ty = content_rect.center().y() - text_height / 2
+            if self._overlay_center:
+                ty = content_rect.center().y() - text_height / 2
+            else:
+                ty = content_rect.height() * 0.1
 
             bg_rect = QRectF(
-                tx - 10,
+                tx - 20,
                 ty - text_height,
-                text_width + 20,
-                text_height + 10,
+                text_width + 40,
+                text_height + 20,
             )
             painter.fillRect(bg_rect, self._overlay_bg)
             painter.setPen(self._overlay_color)
@@ -168,9 +177,9 @@ class ControlPanel(QWidget):
         super().__init__(parent)
 
         # 预设（现在放在最上面）
-        preset_label = QLabel("预设")
-        self.preset_combo = QComboBox()
-        self.preset_combo.addItems(["默认", "更稳", "更跟随"])
+        track_class_label = QLabel("跟踪对象")
+        self.track_class_combo = QComboBox()
+        self.track_class_combo.addItems(["飞机"])
 
         # 平滑度
         self.smooth_slider = QSlider(Qt.Horizontal)
@@ -186,45 +195,21 @@ class ControlPanel(QWidget):
         self.crop_value_label = QLabel("0.80")
         crop_label = QLabel("裁切比例")
 
-        # 跟丢策略
-        mode_label = QLabel("跟丢策略")
-        self.radio_semi = QRadioButton("半自动（丢失时暂停等待你点）")
-        self.radio_auto = QRadioButton("全自动（尝试自己接上）")
-        self.radio_semi.setChecked(True)
-
-        self.mode_group = QButtonGroup(self)
-        self.mode_group.addButton(self.radio_semi)
-        self.mode_group.addButton(self.radio_auto)
-
-        # 点击目标后自动播放
-        self.auto_start_checkbox = QCheckBox("点击目标后自动开始播放")
-        self.auto_start_checkbox.setChecked(True)
-
-        # 导出分辨率
-        res_label = QLabel("导出分辨率")
-        self.res_combo = QComboBox()
-        self.res_combo.addItems([
-            "原始分辨率",
-            "1920x1080",
-            "1280x720",
-            "854x480",
-        ])
-
-        # 高级按钮（暂时占位）
-        self.advanced_btn = QPushButton("高级...")
+        self.recompute = QPushButton("重新运镜")
 
         # 布局
         layout = QVBoxLayout(self)
-        title = QLabel("控制面板")
+        title = QLabel("参数调节")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-weight: bold;")
         layout.addWidget(title)
 
         layout.addSpacing(10)
-        # 预设在最顶部
-        layout.addWidget(preset_label)
-        layout.addWidget(self.preset_combo)
+        # Track label.
+        layout.addWidget(track_class_label)
+        layout.addWidget(self.track_class_combo)
 
+        # Smooth params
         layout.addSpacing(10)
         layout.addWidget(smooth_label)
         layout.addWidget(self.smooth_slider)
@@ -234,29 +219,13 @@ class ControlPanel(QWidget):
         layout.addWidget(crop_label)
         layout.addWidget(self.crop_slider)
         layout.addWidget(self.crop_value_label)
-
-        layout.addSpacing(15)
-        layout.addWidget(mode_label)
-        layout.addWidget(self.radio_semi)
-        layout.addWidget(self.radio_auto)
-
-        layout.addSpacing(10)
-        layout.addWidget(self.auto_start_checkbox)
-
-        layout.addSpacing(15)
-        layout.addWidget(res_label)
-        layout.addWidget(self.res_combo)
-
+        layout.addWidget(self.recompute)
         layout.addStretch(1)
-        layout.addWidget(self.advanced_btn)
-
-        self.setFixedWidth(320)
+        self.setFixedWidth(280)
 
         # 信号连接
         self.smooth_slider.valueChanged.connect(self._on_smooth_changed)
         self.crop_slider.valueChanged.connect(self._on_crop_changed)
-        self.radio_semi.toggled.connect(self._on_mode_toggled)
-        # 预设逻辑目前先不改参数，你之后可以按需求填（比如切换平滑度、裁切比例）
 
     def _on_smooth_changed(self, v: int):
         alpha = v / 100.0
@@ -267,12 +236,6 @@ class ControlPanel(QWidget):
         ratio = v / 100.0
         self.crop_value_label.setText(f"{ratio:.2f}")
         self.cropChanged.emit(ratio)
-
-    def _on_mode_toggled(self, checked: bool):
-        if not checked:
-            return
-        mode = "semi" if self.radio_semi.isChecked() else "auto"
-        self.modeChanged.emit(mode)
 
     def get_export_size(self, orig_width: int, orig_height: int):
         """
@@ -302,38 +265,109 @@ def bgr_to_qpixmap(frame: np.ndarray) -> QPixmap:
     qimg = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format_RGB888)
     return QPixmap.fromImage(qimg)
 
+class TrackEngineInitWorker(QObject):
+    """后台线程里初始化 TrackEngine，用信号把结果丢回主线程。"""
+    finished = Signal(object)   # TrackEngine 实例
+    error = Signal(str)
+
+    @Slot()
+    def run(self):
+        try:
+            engine = TrackEngine()   # 这里会比较慢：加载 YOLO + warmup
+            self.finished.emit(engine)
+        except Exception as e:
+            self.error.emit(str(e))
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("AirSteady 飞影稳拍 - 内测版")
+        self.setWindowTitle("AirSteady 航迹稳拍 - 内测版")
         self.resize(1400, 800)
 
         self.state = AppState.IDLE
-        self.engine: AirSteadyEngine | None = None
 
         # 记录用户最后一次点击的归一化坐标，用于导出时复用
         self.last_click_norm = None  # (x_norm, y_norm) 或 None
 
-        self.play_timer = QTimer(self)
-        self.play_timer.setInterval(40)  # 默认约 25fps，后面按实际 fps 调整
-        self.play_timer.timeout.connect(self._on_play_tick)
+        self.track_play_timer = QTimer(self)
+        self.track_play_timer.setInterval(2) # No delay 2ms
+        self.track_play_timer.timeout.connect(self._on_track_obj)
 
         self._build_ui()
         self._update_state(AppState.IDLE)
+
+        # Load Model & init track engine.
+        # self.track_engine = TrackEngine()
+        self.track_engine: TrackEngine | None = None
+        self._track_engine_thread: QThread | None = None
+        self._start_track_engine_init()
+    
+    def _start_track_engine_init(self):
+        """在后台线程中初始化 TrackEngine（加载 YOLO 模型）"""
+        # 提示一下用户
+        self.status.showMessage("算法加载中，约需几秒，请稍后...")
+        self.raw_view.set_overlay("算法加载中，约需几秒，请稍后...", center=True)
+        # self.steady_view.set_overlay("算法加载中，请稍后...", center=True)
+        self.open_btn.setEnabled(False)
+
+        # 1) 创建线程和 worker
+        self._track_engine_thread = QThread(self)
+        self._track_engine_worker = TrackEngineInitWorker()
+        self._track_engine_worker.moveToThread(self._track_engine_thread)
+
+        # 2) 线程启动时调用 worker.run()
+        self._track_engine_thread.started.connect(self._track_engine_worker.run)
+
+        # 3) 加载完成/出错信号
+        self._track_engine_worker.finished.connect(self._on_track_engine_ready)
+        self._track_engine_worker.error.connect(self._on_track_engine_error)
+
+        # 4) 收尾：退出线程 & 释放 worker / 线程对象
+        self._track_engine_worker.finished.connect(self._track_engine_thread.quit)
+        self._track_engine_worker.finished.connect(self._track_engine_worker.deleteLater)
+        self._track_engine_thread.finished.connect(self._track_engine_thread.deleteLater)
+
+        # 5) 真正启动线程
+        self._track_engine_thread.start()
+
+    def _on_track_engine_ready(self, engine: TrackEngine):
+        """后台线程加载完成时被调用（已回到主线程）"""
+        self.track_engine = engine
+        self.raw_view.clear_overlay()
+        self.steady_view.clear_overlay()
+        self.status.clearMessage()
+        self._update_state(AppState.IDLE)
+        self.open_btn.setEnabled(True)
+        # 如果你想，加载完后也可以把按钮文字/颜色改一下
+
+    def _on_track_engine_error(self, msg: str):
+        """后台初始化失败"""
+        self.track_engine = None
+        self.status.showMessage(f"模型加载失败: {msg}")
+        self.raw_view.set_overlay(f"模型加载失败: {msg}", center=True)
+        # self.steady_view.set_overlay(f"模型加载失败: {msg}", center=True)
+        self.open_btn.setEnabled(False)
 
     # ---------------- UI 建立 ----------------
     def _build_ui(self):
         # 顶部工具条
         self.open_btn = QPushButton("打开视频")
         self.export_btn = QPushButton("导出视频")
+        self.readme_btn = QPushButton("使用说明")
+        self.feedback_btn = QPushButton("问题反馈")
+        self.author_bth = QPushButton("联系我们")
         self.file_label = QLabel("未加载视频")
 
         top_bar = QWidget()
         top_layout = QHBoxLayout(top_bar)
         top_layout.addWidget(self.open_btn)
         top_layout.addWidget(self.export_btn)
+        # top_layout.addStretch(1)
+        top_layout.addWidget(self.readme_btn)
+        top_layout.addWidget(self.feedback_btn)
+        top_layout.addWidget(self.author_bth)
         top_layout.addStretch(1)
         top_layout.addWidget(self.file_label)
 
@@ -377,7 +411,7 @@ class MainWindow(QMainWindow):
         # 状态栏
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("准备就绪 - 请先打开视频")
+        # self.status.showMessage("准备就绪 - 请先打开视频 - 开始处理")
 
         # 信号连接
         self.open_btn.clicked.connect(self._on_open_clicked)
@@ -392,6 +426,11 @@ class MainWindow(QMainWindow):
 
         self.raw_view.clicked.connect(self._on_raw_view_clicked)
 
+    def _on_export_progress(self, percent: float):
+        # 更新状态栏 或者 overlay
+        self.status.showMessage(f"正在导出稳像视频... {percent:.1f}%")
+        self.steady_view.set_overlay(f"正在导出稳像视频... {percent:.1f}%", center=False)
+
     # ---------------- 状态切换 ----------------
     def _update_state(self, new_state: AppState):
         self.state = new_state
@@ -405,40 +444,50 @@ class MainWindow(QMainWindow):
         self.steady_view.clear_overlay()
 
         if new_state == AppState.IDLE:
-            self.status.showMessage("准备就绪 - 请先打开视频")
+            help_text = "打开视频 -> 等待自动稳像 -> [可选：参数调节&重新运镜] -> 导出视频"
+            self.status.showMessage(help_text)
+            self.raw_view.set_overlay(help_text, center=True)
+            # self.steady_view.set_overlay(help_text, center=True)
 
-        elif new_state == AppState.LOADED_NO_TARGET:
-            self.export_btn.setEnabled(False)
-            self.timeline_slider.setEnabled(True)
-            self.prev_btn.setEnabled(True)
-            self.play_btn.setEnabled(False)
-            self.raw_view.set_overlay("请点击你要跟踪的目标")
-            self.status.showMessage("已加载视频，请在左侧画面点击你要跟踪的目标")
-
-        elif new_state == AppState.READY:
-            self.export_btn.setEnabled(True)
-            self.timeline_slider.setEnabled(True)
-            self.prev_btn.setEnabled(True)
-            self.play_btn.setEnabled(True)
-            self.play_btn.setText("▶")
-            self.status.showMessage("已选中目标，点击播放开始稳像")
-
-        elif new_state == AppState.PLAYING:
-            self.export_btn.setEnabled(True)
-            self.timeline_slider.setEnabled(True)
+        elif new_state == AppState.TRACKING:
+            self.open_btn.setEnabled(True)
+            self.export_btn.setEnabled(False)        
+            self.timeline_slider.setEnabled(False)
             self.prev_btn.setEnabled(False)
-            self.play_btn.setEnabled(True)
-            self.play_btn.setText("⏸")
-            self.status.showMessage("稳定跟踪中... 空格或点击暂停按钮可暂停")
+            self.play_btn.setEnabled(False)
+            self.control_panel.track_class_combo.setEnabled(False)
+            self.control_panel.recompute.setEnabled(False)
 
-        elif new_state == AppState.LOST:
+            self.raw_view.set_overlay("跟踪中... \n跟踪完成后将进行自动运镜", center=False)
+            self.steady_view.clear_overlay()
+            self.status.showMessage("跟踪中...")
+
+        elif new_state == AppState.TRACK_DONE:
+            self.export_btn.setEnabled(False)
+            self.timeline_slider.setEnabled(False)
+            self.prev_btn.setEnabled(False)
+            self.play_btn.setEnabled(False)
+            # self.play_btn.setText("▶")
+            self.status.showMessage("跟踪完成")
+
+        elif new_state == AppState.PLANNING:
+            self.export_btn.setEnabled(False)
+            self.timeline_slider.setEnabled(False)
+            self.prev_btn.setEnabled(False)
+            self.play_btn.setEnabled(False)
+            # self.play_btn.setText("⏸")
+            self.raw_view.clear_overlay()
+            self.steady_view.set_overlay("正在规划最优运镜路径，请稍等...", center=True)
+            self.status.showMessage("正在规划最优运镜路径，请稍等...")
+
+        elif new_state == AppState.PLAN_DONE:
             self.export_btn.setEnabled(True)
             self.timeline_slider.setEnabled(True)
             self.prev_btn.setEnabled(True)
             self.play_btn.setEnabled(True)
             self.play_btn.setText("▶")
-            self.raw_view.set_overlay("目标丢失，请在当前画面重新点击目标", QColor(255, 200, 200))
-            self.status.showMessage("目标丢失，请在当前画面重新点击目标")
+            self.raw_view.set_overlay("规划完成，请点击播放按钮预览结果", QColor(255, 200, 200))
+            self.status.showMessage("规划完成，请点击播放按钮预览结果")
 
         elif new_state == AppState.EXPORTING:
             self.open_btn.setEnabled(False)
@@ -460,207 +509,126 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        # 初始化算法引擎
-        crop_ratio = self.control_panel.crop_slider.value() / 100.0
-        ema_alpha = self.control_panel.smooth_slider.value() / 100.0
-        mode = "semi" if self.control_panel.radio_semi.isChecked() else "auto"
+        print("video path", path)
 
-        self.engine = AirSteadyEngine(
-            crop_ratio=crop_ratio,
-            ema_alpha=ema_alpha,
-            mode=mode,
-        )
-        self.last_click_norm = None
-
-        self.engine.open_video(path)
+        # Reset track engin
+        self.track_play_timer.stop()
+        self.track_engine.finished()
+        self.track_engine.open_video(path)
         self.file_label.setText(path)
 
-        total_frames = self.engine.total_frames
+        total_frames = self.track_engine.total_frames
         self.timeline_slider.setRange(0, max(0, total_frames - 1))
 
-        # 读取第一帧（带检测）
-        vis, steady, info = self.engine.next_frame()
-        if vis is not None:
-            self.raw_view.set_frame_pixmap(bgr_to_qpixmap(vis))
-            self.steady_view.set_frame_pixmap(bgr_to_qpixmap(steady))
-            self.timeline_slider.setValue(info["frame_idx"])
-            self._update_time_label(info["frame_idx"], info["total_frames"], self.engine.fps)
-
-        self._update_state(AppState.LOADED_NO_TARGET)
+        # Start to track.
+        self.track_play_timer.start()
+        self._update_state(AppState.TRACKING)
 
     def _on_export_clicked(self):
-        if not self.engine or self.state in (AppState.IDLE, AppState.LOADED_NO_TARGET):
-            return
-
-        save_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "选择导出文件路径",
-            "",
-            "Video Files (*.mp4)",
-        )
-        if not save_path:
-            return
-
-        self._update_state(AppState.EXPORTING)
-
-        # 导出分辨率
-        export_size = self.control_panel.get_export_size(
-            self.engine.width, self.engine.height
-        )
-
-        def progress_callback(frame_idx, total_frames):
-            percent = int(frame_idx / max(1, total_frames) * 100)
-            self.steady_view.set_overlay(
-                f"正在导出稳像视频... {percent}%",
-                QColor(220, 220, 255)
-            )
-            self.status.showMessage(f"正在导出稳像视频... {percent}%")
-            QApplication.processEvents()
-
-        try:
-            self.engine.export_video(
-                save_path,
-                progress_callback=progress_callback,
-                click_norm=self.last_click_norm,
-                export_size=export_size,
-            )
-        except Exception as e:
-            self.status.showMessage(f"导出失败: {e}")
-        else:
-            self.status.showMessage(f"导出完成: {save_path}")
-            self.steady_view.set_overlay("导出完成，已保存文件", QColor(200, 255, 200))
-        finally:
-            if self.engine and self.engine.target_track_id is not None:
-                self._update_state(AppState.READY)
-            else:
-                self._update_state(AppState.LOADED_NO_TARGET)
+        print("waitting")
 
     def _on_play_pause_clicked(self):
-        if self.state == AppState.PLAYING:
-            self._pause_playback()
-        elif self.state in (AppState.READY, AppState.LOST):
-            self._start_playback()
+        print("pause")
 
     def _on_prev_clicked(self):
-        # 简单实现：往前一帧（会重置跟踪和缓存）
-        if not self.engine:
-            return
-        idx = max(0, self.engine.current_frame_idx - 1)
-        self._seek_to_frame(idx)
+        print("_on_prev_clicked")
 
     def _on_timeline_released(self):
-        if not self.engine:
-            return
-        frame_idx = self.timeline_slider.value()
-        self._seek_to_frame(frame_idx)
+        print("_on_timeline_released")
 
     def _on_smooth_changed(self, alpha: float):
-        if self.engine:
-            self.engine.ema_alpha = float(alpha)
+        print("_on_smooth_changed")
+        # if self.engine:
+        #     self.engine.ema_alpha = float(alpha)
 
     def _on_crop_changed(self, ratio: float):
-        if self.engine:
-            self.engine.crop_ratio = float(ratio)
-            if self.engine.width > 0 and self.engine.height > 0:
-                self.engine.crop_w = int(self.engine.width * self.engine.crop_ratio)
-                self.engine.crop_h = int(self.engine.height * self.engine.crop_ratio)
-
-    def _on_mode_changed(self, mode: str):
-        if self.engine:
-            self.engine.set_mode(mode)
+        print("_on_smooth_changed")
 
     def _on_raw_view_clicked(self, x_norm: float, y_norm: float):
-        if not self.engine:
-            return
-        if self.state in (AppState.IDLE, AppState.EXPORTING):
-            return
-
-        # 1) 自己记一份，导出时复用
-        self.last_click_norm = (x_norm, y_norm)
-
-        # 2) 告诉引擎（引擎会在当前帧 boxes 上找最近的那个）
-        self.engine.set_pending_click(x_norm, y_norm)
-
-        # 第一次选目标：LOADED_NO_TARGET / LOST -> READY
-        if self.state in (AppState.LOADED_NO_TARGET, AppState.LOST):
-            self._update_state(AppState.READY)
-
-        # 自动开始播放
-        if self.control_panel.auto_start_checkbox.isChecked():
-            self._start_playback()
+        print("_on_raw_view_clicked")
 
     # ---------------- 播放控制 ----------------
     def _start_playback(self):
-        if not self.engine:
-            return
-        if self.state not in (AppState.READY, AppState.LOST):
-            return
-
-        interval = int(1000.0 / max(1.0, self.engine.fps))
-        self.play_timer.setInterval(interval)
-        self.play_timer.start()
-        self._update_state(AppState.PLAYING)
+        # 预览状态可用空格触发
+        print("x")
 
     def _pause_playback(self):
-        self.play_timer.stop()
-        if self.engine and self.engine.target_track_id is not None:
-            self._update_state(AppState.READY)
-        else:
-            self._update_state(AppState.LOADED_NO_TARGET)
+        # 预览状态 可用空格触发
+        print("x")
 
-    def _on_play_tick(self):
-        if not self.engine:
+    def _on_track_obj(self):
+        if not self.track_engine:
             return
+        
+        vis, track_result = self.track_engine.next_frame()
 
-        vis, steady, info = self.engine.next_frame()
+        # === 1) 跟踪结束 ===
         if vis is None:
-            self.play_timer.stop()
-            if self.engine.target_track_id is not None:
-                self._update_state(AppState.READY)
-            else:
-                self._update_state(AppState.LOADED_NO_TARGET)
+            self.track_play_timer.stop()
+            self.track_engine.finished()
+            self._update_state(AppState.TRACK_DONE)
+
+            # 所有帧的跟踪结果（list[TrackFrame]）
+            track_result_all = self.track_engine.track_results
+
+            # 读当前 UI 参数
+            smooth_factor = self.control_panel.smooth_slider.value() / 100.0
+            max_crop_ratio = self.control_panel.crop_slider.value() / 100.0
+            print(smooth_factor, max_crop_ratio)
+
+            # 进入 PLANNING 状态（UI 显示“正在规划运镜...”）
+            self._update_state(AppState.PLANNING)
+
+            # 这里先直接在主线程里算（后面你要的话可以放到 QThread 里）
+            self.crop_traj = algorithm.planning_crop_traj(
+                track_result=track_result_all,
+                img_width=self.track_engine.scale_width,
+                img_height=self.track_engine.scale_height,
+                max_crop_ratio=max_crop_ratio,
+                smooth_factor=smooth_factor,
+                debug=False,   # 方便你调试轨迹
+            )
+
+            # 规划完成
+            self._update_state(AppState.PLAN_DONE)
+
+            # TODO：这里开始根据裁切结果：self.crop_traj，进行
+            algorithm.export_stabilized_video(
+                input_video_path=self.track_engine.tmp_video_path,
+                crop_frames=self.crop_traj,
+                output_video_path=os.path.join(utils.get_airsteady_cache_dir(), "tmp_crop.mp4"),
+                work_width=self.track_engine.scale_width,
+                work_height=self.track_engine.scale_height,
+                progress_cb=self._on_export_progress,  # 比如更新状态栏/overlay
+            )
+
+            # TODO: 这里后面可以加一行，按当前时间轴选一帧稳像结果，刷新 steady_view
+            
+
             return
 
-        self.raw_view.set_frame_pixmap(bgr_to_qpixmap(vis))
-        self.steady_view.set_frame_pixmap(bgr_to_qpixmap(steady))
+        # === 2) 跟踪过程 ===
 
-        frame_idx = info["frame_idx"]
-        total_frames = info["total_frames"]
+        # Show image
+        self.raw_view.set_frame_pixmap(bgr_to_qpixmap(vis))
+
+        frame_idx = track_result.frame_idx
+        total_frames = self.track_engine.total_frames
         self.timeline_slider.blockSignals(True)
         self.timeline_slider.setValue(frame_idx)
         self.timeline_slider.blockSignals(False)
-        self._update_time_label(frame_idx, total_frames, self.engine.fps)
+        self._update_time_label(frame_idx, total_frames, self.track_engine.fps)
 
-        # 半自动模式下，如果丢失，则暂停并进入 LOST 状态
-        if info["is_lost"] and (self.engine.mode == "semi"):
-            self.play_timer.stop()
-            self._update_state(AppState.LOST)
+        # complete ratio
+        complete_ratio = 100 * float(frame_idx) / total_frames
+        self.raw_view.set_overlay(
+            f"跟踪中...{int(round(complete_ratio))}%\n跟踪完成后将进行自动运镜",
+            center=False,
+        )
+
 
     def _seek_to_frame(self, frame_idx: int):
-        if not self.engine or not self.engine.cap:
-            return
-
-        self.play_timer.stop()
-
-        # 跳转到指定帧，并重置 tracking + 缓存
-        self.engine.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        self.engine.current_frame_idx = frame_idx
-        self.engine.reset_tracking(clear_click=True, clear_cache=True)
-        self.last_click_norm = None
-
-        vis, steady, info = self.engine.next_frame()
-        if vis is None:
-            return
-
-        self.raw_view.set_frame_pixmap(bgr_to_qpixmap(vis))
-        self.steady_view.set_frame_pixmap(bgr_to_qpixmap(steady))
-
-        self.timeline_slider.blockSignals(True)
-        self.timeline_slider.setValue(info["frame_idx"])
-        self.timeline_slider.blockSignals(False)
-        self._update_time_label(info["frame_idx"], info["total_frames"], self.engine.fps)
-
-        self._update_state(AppState.LOADED_NO_TARGET)
+        print("_seek_to_frame")
 
     def _update_time_label(self, frame_idx: int, total_frames: int, fps: float):
         fps = max(fps, 1e-3)
