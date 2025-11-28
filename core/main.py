@@ -225,15 +225,15 @@ class ControlPanel(QWidget):
         # 镜头稳定程度（平滑度）
         self.smooth_slider = QSlider(Qt.Horizontal)
         self.smooth_slider.setRange(1, 99)
-        self.smooth_slider.setValue(50)
-        self.smooth_value_label = QLabel("0.50")
+        self.smooth_slider.setValue(80)
+        self.smooth_value_label = QLabel("0.80")
         smooth_label = QLabel("镜头稳定程度")
         self.smooth_left_label = QLabel("跟随原片")
         self.smooth_right_label = QLabel("强力稳像")
 
         # 裁切保留比例
         self.crop_slider = QSlider(Qt.Horizontal)
-        self.crop_slider.setRange(40, 100)  # 0.4 ~ 1.0
+        self.crop_slider.setRange(10, 100)  # 0.1 ~ 1.0
         self.crop_slider.setValue(80)
         self.crop_value_label = QLabel("0.80")
         crop_label = QLabel("裁切保留比例")
@@ -520,9 +520,9 @@ class PlanAndPreviewWorker(QObject):
         output_video_path: str,
         work_width: int,
         work_height: int,
-        parent=None,   # 这里保持不变，下面调用的时候会传 parent=self
     ):
-        super().__init__(parent)
+        # ⭐ 不要把 worker 挂到 MainWindow 下面，避免跨线程 parent
+        super().__init__(None)
         self._track_result = track_result
         self._img_width = int(img_width)
         self._img_height = int(img_height)
@@ -536,6 +536,7 @@ class PlanAndPreviewWorker(QObject):
     @Slot()
     def run(self):
         try:
+            print("[PlanAndPreviewWorker] start planning...")
             # STEP1: 轨迹规划（纯算法，不碰 UI）
             crop_traj = algorithm.planning_crop_traj(
                 track_result=self._track_result,
@@ -546,6 +547,7 @@ class PlanAndPreviewWorker(QObject):
                 debug=False,
             )
 
+            print("[PlanAndPreviewWorker] planning done, start export preview...")
             # STEP2: 根据裁切结果导出预览用的小视频
             def _cb(p):
                 try:
@@ -562,8 +564,10 @@ class PlanAndPreviewWorker(QObject):
                 progress_cb=_cb,
             )
 
+            print("[PlanAndPreviewWorker] export preview done.")
             self.finished.emit(crop_traj, self._output_video_path)
         except Exception as e:
+            print("[PlanAndPreviewWorker] error in run:", e)
             self.error.emit(str(e))
 
 
@@ -685,6 +689,7 @@ class MainWindow(QMainWindow):
         # 提示一下用户
         self.status.showMessage("算法加载中，约需几秒，请稍后...")
         self.raw_view.set_overlay("算法加载中，约需几秒，请稍后...", center=True)
+        self.steady_view.set_overlay("算法加载中，约需几秒，请稍后...", center=True)
         self.open_btn.setEnabled(False)
 
         # 1) 创建线程和 worker
@@ -845,9 +850,11 @@ class MainWindow(QMainWindow):
 
         if new_state == AppState.IDLE:
             self._reset_video_views()
-            help_text = "打开视频 -> 自动跟踪 -> 规划运镜 -> 预览对比 -> 导出视频"
+            help_text = "打开视频 -> 自动跟踪&运镜 -> 预览对比&重新运镜 -> 导出视频"
             self.status.showMessage(help_text)
             self.raw_view.set_overlay(help_text, center=True)
+            self.steady_view.set_overlay(help_text, center=True)
+            self.control_panel.recompute.setEnabled(False)
 
         elif new_state == AppState.TRACKING:
             self.open_btn.setEnabled(True)
@@ -890,13 +897,13 @@ class MainWindow(QMainWindow):
             self.control_panel.recompute.setEnabled(True)
 
             self.raw_view.set_overlay(
-                "稳像完成，可播放预览效果\n如效果不佳，建议减少裁切保留比例+强力稳像",
+                "稳像完成，请播放预览效果 -> 导出视频\n若效果不佳，请减少裁切保留比例+强力稳像 -> 重新运镜",
                 center=False,
                 color=QColor(255, 200, 200),
             )
 
             self.steady_view.set_overlay(
-                "稳像完成，可播放预览效果\n如效果不佳，建议减少裁切保留比例+强力稳像",
+                "稳像完成，可播放预览效果 -> 导出视频\n若效果不佳，请减少裁切保留比例+强力稳像 -> 重新运镜",
                 center=False,
                 color=QColor(255, 200, 200),
             )
@@ -1074,6 +1081,11 @@ class MainWindow(QMainWindow):
         if not self.track_engine or not self.track_result_all:
             return
 
+        # 如果上一次线程还没结束，简单保护一下（正常不会进来）
+        if self._plan_thread is not None and self._plan_thread.isRunning():
+            print("[PlanAndPreview] previous thread still running, skip.")
+            return
+
         # 更新状态到 PLANNING，给用户提示
         self._update_state(AppState.PLANNING)
 
@@ -1081,10 +1093,8 @@ class MainWindow(QMainWindow):
         self.preview_raw_path = self.track_engine.tmp_video_path
         self.preview_steady_path = os.path.join(utils.get_airsteady_cache_dir(), "tmp_crop.mp4")
 
-        # 如果之前有老的线程，理论上已经 quit + deleteLater 了，这里简单覆盖即可
-        self._plan_thread = QThread(self)
-
-        # ⭐ 把 worker 挂在 self 上，并指定 parent=self，防止被 GC
+        # 创建线程 & worker（都不挂 parent，交给 Qt 线程结束时 deleteLater）
+        self._plan_thread = QThread()
         self._plan_worker = PlanAndPreviewWorker(
             track_result=self.track_result_all,
             img_width=self.track_engine.scale_width,
@@ -1095,29 +1105,40 @@ class MainWindow(QMainWindow):
             output_video_path=self.preview_steady_path,
             work_width=self.track_engine.scale_width,
             work_height=self.track_engine.scale_height,
-            parent=self,   # ⭐ 关键：让 Qt 管理生命周期
         )
+
+        # 把 worker 丢到线程里
         self._plan_worker.moveToThread(self._plan_thread)
 
         # 线程启动 -> worker.run
         self._plan_thread.started.connect(self._plan_worker.run)
 
-        # 进度发回主线程，复用预览导出的进度文本
+        # 进度：回到主线程，更新 overlay 文本
         self._plan_worker.progress.connect(self._on_export_progress)
 
-        # 规划+导出成功
+        # 成功 / 失败 信号
         self._plan_worker.finished.connect(self._on_plan_preview_finished)
-        self._plan_worker.finished.connect(self._plan_worker.deleteLater)
-        self._plan_worker.finished.connect(self._plan_thread.quit)
-
-        # 出错
         self._plan_worker.error.connect(self._on_plan_preview_error)
-        self._plan_worker.error.connect(self._plan_worker.deleteLater)
+
+        # 无论成功还是失败，都要把线程停掉
+        self._plan_worker.finished.connect(self._plan_thread.quit)
         self._plan_worker.error.connect(self._plan_thread.quit)
 
+        # 线程结束后再真正 delete 对象，避免还在跑的时候对象被删
+        self._plan_thread.finished.connect(self._plan_worker.deleteLater)
         self._plan_thread.finished.connect(self._plan_thread.deleteLater)
 
+        # 方便下次判断 isRunning / 复用
+        def _cleanup():
+            print("[PlanAndPreview] thread finished, cleanup.")
+            self._plan_thread = None
+            self._plan_worker = None
+
+        self._plan_thread.finished.connect(_cleanup)
+
+        print("[PlanAndPreview] start thread...")
         self._plan_thread.start()
+
 
     def _on_plan_preview_finished(self, crop_traj, steady_path: str):
         """
@@ -1130,7 +1151,7 @@ class MainWindow(QMainWindow):
 
         # 初始化预览播放器
         self._init_preview_player()
-        # 更新状态为 PLAN_DONE
+        # 更新状态为 PLAN_DONE（会把“正在规划...”替换掉）
         self._update_state(AppState.PLAN_DONE)
 
     def _on_plan_preview_error(self, msg: str):
@@ -1142,6 +1163,7 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "运镜失败", f"规划运镜或生成预览失败：\n{msg}")
         # 回到 TRACK_DONE 状态，让用户可以调整参数后重试
         self._update_state(AppState.TRACK_DONE)
+
 
     def _on_recompute_clicked(self):
         """PLAN_DONE 状态下，使用当前 slider 参数重新规划 + 重新导出 + 回到预览。"""
@@ -1168,7 +1190,7 @@ class MainWindow(QMainWindow):
         # 映射到算法参数
         smooth_factor = float(np.clip(1.0 - smooth_ui, 0.0, 1.0))
         # keep_ratio = 1.0 -> max_crop_ratio = 0.0 (不裁切)
-        max_crop_ratio = float(np.clip(1.0 - keep_ratio, 0.0, 0.6))
+        max_crop_ratio = float(np.clip(1.0 - keep_ratio, 0.0, 0.9))
 
         print(
             f"[Recompute] smooth_factor={smooth_factor:.3f}, "
@@ -1348,7 +1370,7 @@ class MainWindow(QMainWindow):
 
             # 映射到算法参数
             smooth_factor = float(np.clip(1.0 - smooth_ui, 0.0, 1.0))
-            max_crop_ratio = float(np.clip(1.0 - keep_ratio, 0.0, 0.6))
+            max_crop_ratio = float(np.clip(1.0 - keep_ratio, 0.0, 0.9))
 
             print(
                 f"smooth_factor = {smooth_factor:.3f} "
