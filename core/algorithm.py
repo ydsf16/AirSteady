@@ -678,10 +678,17 @@ def solve_smooth_trajectory(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Huber-IRLS 版本的双轴平滑。
+    当 smooth_factor 非常小时，直接返回观测，避免线性系统奇异。
     """
     n = len(obs_cx)
     if n == 0:
         return np.zeros(0, dtype=float), np.zeros(0, dtype=float)
+
+    # 如果平滑度几乎为 0，就不要建方程，直接用观测（已经过 clamp + 回中处理）
+    if smooth_factor <= 1e-6:
+        px = np.asarray(obs_cx, dtype=float).copy()
+        py = np.asarray(obs_cy, dtype=float).copy()
+        return px, py
 
     px = _solve_axis_sparse_huber(
         obs=obs_cx,
@@ -710,17 +717,30 @@ def compute_global_crop_ratio(
 ) -> float:
     """
     Step2: 只用有效帧(effective_mask==True)来计算全局裁切比例。
-    无效帧在这里不参与（正如你说的“无效帧不需要算裁切比例和 clamp”）。
+    - max_crop_ratio: 最大允许裁切比例（0 表示完全不裁切）
     """
-    max_crop_ratio = float(np.clip(max_crop_ratio, 0.0, 0.5))
+    # 限制到安全范围
+    max_crop_ratio = float(np.clip(max_crop_ratio, 0.0, 0.9))
+
+    if max_crop_ratio <= 1e-6:
+        # 明确表示“不裁切”
+        return 0.0
 
     if np.any(effective_mask):
         px_eff = px[effective_mask]
         py_eff = py[effective_mask]
     else:
-        # 没有任何有效观测，就用全轨迹（总得保证不出黑边）
         px_eff = px
         py_eff = py
+
+    # 如果 px/py 里有 NaN，这里直接防御
+    valid = np.isfinite(px_eff) & np.isfinite(py_eff)
+    if not np.any(valid):
+        # 全部 NaN 的话，退化成不裁切
+        return 0.0
+
+    px_eff = px_eff[valid]
+    py_eff = py_eff[valid]
 
     dx_left = px_eff
     dx_right = W - px_eff
@@ -736,9 +756,17 @@ def compute_global_crop_ratio(
     per_frame_required = np.maximum(crop_ratio_x, crop_ratio_y)
     per_frame_required = np.clip(per_frame_required, 0.0, 1.0)
 
-    required_crop_ratio = float(np.nanmax(per_frame_required))
+    # 再防一个：如果这里意外出现 NaN
+    valid2 = np.isfinite(per_frame_required)
+    if not np.any(valid2):
+        required_crop_ratio = 0.0
+    else:
+        required_crop_ratio = float(np.max(per_frame_required[valid2]))
+
     crop_ratio = float(min(required_crop_ratio, max_crop_ratio))
+    crop_ratio = float(np.clip(crop_ratio, 0.0, 1.0))
     return crop_ratio
+
 
 def build_crop_frames(
     timestamps: np.ndarray,
