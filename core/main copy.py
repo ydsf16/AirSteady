@@ -21,12 +21,6 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QToolButton,
     QComboBox,
-    QDialog,
-    QLineEdit,
-    QFormLayout,
-    QDialogButtonBox,
-    QProgressBar,
-    QMessageBox,
 )
 
 from algorithm import TrackEngine  # 你的算法文件
@@ -258,186 +252,6 @@ class ControlPanel(QWidget):
         self.cropChanged.emit(keep_ratio)
 
 
-class ExportDialog(QDialog):
-    """
-    导出设置对话框：
-    - 格式（目前固定 mp4）
-    - 分辨率（自动裁切 / 原片 / 推荐分辨率）
-    - 保存路径
-    """
-
-    def __init__(
-        self,
-        parent,
-        src_w: int,
-        src_h: int,
-        auto_w: int,
-        auto_h: int,
-        default_basename: str,
-    ):
-        super().__init__(parent)
-        self.setWindowTitle("导出视频")
-
-        self._src_w = src_w
-        self._src_h = src_h
-        self._auto_w = auto_w
-        self._auto_h = auto_h
-
-        self.selected_path: str = ""
-        self.selected_mode: str = "auto"
-        self.selected_width: int = auto_w
-        self.selected_height: int = auto_h
-
-        # --- 导出格式（仅 mp4） ---
-        self.format_combo = QComboBox()
-        self.format_combo.addItem("MP4 (.mp4)")
-        fmt_label = QLabel("导出格式：")
-        fmt_tip = QLabel("内测版本只支持导出 mp4 格式，正式版本将支持更多格式。")
-        fmt_tip.setWordWrap(True)
-
-        # --- 分辨率选项 ---
-        self.resolution_combo = QComboBox()
-        # 自动裁切后的分辨率
-        self.resolution_combo.addItem(
-            f"自动裁切分辨率（{auto_w} x {auto_h}）",
-            ("auto", auto_w, auto_h),
-        )
-        # 原片分辨率
-        self.resolution_combo.addItem(
-            f"原片分辨率（{src_w} x {src_h}）",
-            ("source", src_w, src_h),
-        )
-
-        # 推荐分辨率（同纵横比，且不超过原片）
-        rec_sizes = self._make_recommended_resolutions(src_w, src_h)
-        for w, h in rec_sizes:
-            self.resolution_combo.addItem(
-                f"推荐：{w} x {h}",
-                ("fixed", w, h),
-            )
-
-        res_label = QLabel("导出分辨率：")
-
-        # --- 保存路径 ---
-        path_label = QLabel("保存路径：")
-        self.path_edit = QLineEdit()
-        default_dir = os.path.expanduser("~/Videos")
-        if not os.path.isdir(default_dir):
-            default_dir = os.path.expanduser("~")
-        default_name = default_basename if default_basename else "airsteady_output.mp4"
-        if not default_name.lower().endswith(".mp4"):
-            default_name += ".mp4"
-        default_path = os.path.join(default_dir, default_name)
-        self.path_edit.setText(default_path)
-
-        browse_btn = QPushButton("浏览...")
-        browse_btn.clicked.connect(self._on_browse)
-
-        path_row = QHBoxLayout()
-        path_row.addWidget(self.path_edit, 1)
-        path_row.addWidget(browse_btn)
-
-        # --- 按钮 ---
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-
-        # --- 布局 ---
-        form = QFormLayout()
-        form.addRow(fmt_label, self.format_combo)
-        form.addRow("", fmt_tip)
-        form.addRow(res_label, self.resolution_combo)
-        form.addRow(path_label, path_row)
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addSpacing(10)
-        layout.addWidget(buttons)
-
-    def _make_recommended_resolutions(self, src_w: int, src_h: int):
-        """
-        基于原片分辨率和纵横比给出几档推荐分辨率（不超过原片）。
-        """
-        if src_w <= 0 or src_h <= 0:
-            return []
-
-        ratio = float(src_w) / float(src_h)
-        # 常见 16:9 档位，也适配其他比例时做个近似
-        candidates = [
-            (3840, 2160),
-            (2560, 1440),
-            (1920, 1080),
-            (1600, 900),
-            (1280, 720),
-            (960, 540),
-        ]
-        result = []
-        for w, h in candidates:
-            if w <= src_w and h <= src_h:
-                r = float(w) / float(h)
-                if abs(r - ratio) < 0.03:
-                    result.append((w, h))
-        # 去重、最多 3 个
-        uniq = []
-        for wh in result:
-            if wh not in uniq:
-                uniq.append(wh)
-        return uniq[:3]
-
-    def _on_browse(self):
-        init_path = self.path_edit.text().strip() or os.path.expanduser("~/Videos")
-        if os.path.isdir(init_path):
-            init_dir = init_path
-        else:
-            init_dir = os.path.dirname(init_path) if os.path.dirname(init_path) else os.path.expanduser("~")
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "选择导出路径",
-            init_dir,
-            "MP4 Video (*.mp4)",
-        )
-        if not path:
-            return
-        if not path.lower().endswith(".mp4"):
-            path += ".mp4"
-        self.path_edit.setText(path)
-
-    def accept(self):
-        # 检查保存路径
-        path = self.path_edit.text().strip()
-        if not path:
-            self._on_browse()
-            path = self.path_edit.text().strip()
-            if not path:
-                return
-
-        if not path.lower().endswith(".mp4"):
-            path += ".mp4"
-            self.path_edit.setText(path)
-
-        # 解析分辨率模式
-        data = self.resolution_combo.currentData()
-        if not data:
-            data = ("auto", self._auto_w, self._auto_h)
-        mode, w, h = data
-
-        self.selected_path = path
-        self.selected_mode = mode
-        self.selected_width = int(w)
-        self.selected_height = int(h)
-
-        super().accept()
-
-    def get_selection(self):
-        return (
-            self.selected_path,
-            self.selected_mode,
-            self.selected_width,
-            self.selected_height,
-        )
-
-
 def bgr_to_qpixmap(frame: np.ndarray) -> QPixmap:
     """将 BGR 图像转换为 QPixmap"""
     if frame is None:
@@ -598,7 +412,6 @@ class MainWindow(QMainWindow):
 
         self.timeline_slider = QSlider(Qt.Horizontal)
         self.timeline_slider.setRange(0, 0)
-        self.timeline_slider.setValue(0)
         self.time_label = QLabel("00:00 / 00:00")
 
         bottom_bar = QWidget()
@@ -617,15 +430,9 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central)
 
-        # 状态栏 + 导出进度条
+        # 状态栏
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-
-        self.export_progress = QProgressBar()
-        self.export_progress.setRange(0, 100)
-        self.export_progress.setValue(0)
-        self.export_progress.setVisible(False)
-        self.status.addPermanentWidget(self.export_progress)
 
         # 信号连接
         self.open_btn.clicked.connect(self._on_open_clicked)
@@ -676,10 +483,13 @@ class MainWindow(QMainWindow):
         self.play_btn.setEnabled(False)
         self.prev_btn.setEnabled(False)
         self.timeline_slider.setEnabled(False)
+        # overlay 不一律清掉，交给具体状态控制
+        # self.raw_view.clear_overlay()
+        # self.steady_view.clear_overlay()
 
         if new_state == AppState.IDLE:
             self._reset_video_views()
-            help_text = "打开视频 -> 自动跟踪 -> 规划运镜 -> 预览对比 -> 导出视频"
+            help_text = "打开视频 -> 自动跟踪&运镜 -> 预览对比&调参&重算运镜 -> 导出视频"
             self.status.showMessage(help_text)
             self.raw_view.set_overlay(help_text, center=True)
 
@@ -722,7 +532,8 @@ class MainWindow(QMainWindow):
             self.play_btn.setText("▶")
             self.control_panel.recompute.setEnabled(True)
 
-            self.raw_view.set_overlay("稳像完成，可播放预览效果\n如效果不佳，建议减少裁切保留比例+强力稳像", center=False, color=QColor(255, 200, 200))
+            self.raw_view.set_overlay("稳像完成，可播放预览效果\n空格或下方播放键可控制播放/暂停", center=False, color=QColor(255, 200, 200))
+            # self.steady_view.set_overlay("稳像完成，可播放预览效果\n空格或下方播放键可控制播放/暂停", center=False, color=QColor(255, 200, 200))
             self.status.showMessage("稳像完成，可播放预览效果")
 
         elif new_state == AppState.EXPORTING:
@@ -731,11 +542,8 @@ class MainWindow(QMainWindow):
             self.play_btn.setEnabled(False)
             self.prev_btn.setEnabled(False)
             self.timeline_slider.setEnabled(False)
-            self.control_panel.recompute.setEnabled(False)
             self.steady_view.set_overlay("正在导出稳像视频...", center=True, color=QColor(220, 220, 255))
             self.status.showMessage("正在导出稳像视频...")
-            # self.export_progress.setVisible(True)
-            self.export_progress.setValue(0)
 
     # ---------------- 控件回调 ----------------
     def _on_open_clicked(self):
@@ -780,73 +588,9 @@ class MainWindow(QMainWindow):
         self.track_play_timer.start()
         self._update_state(AppState.TRACKING)
 
-    def _compute_auto_export_size(self):
-        """
-        估算“自动裁切后”的自然输出分辨率（用于导出选项显示）。
-        """
-        if not self.track_engine or not self.crop_traj:
-            return 0, 0
-
-        src_w = max(1, int(self.track_engine.width))
-        src_h = max(1, int(self.track_engine.height))
-        work_w = max(1, int(self.track_engine.scale_width))
-        work_h = max(1, int(self.track_engine.scale_height))
-
-        sx = src_w / float(work_w)
-        sy = src_h / float(work_h)
-
-        first_cf = self.crop_traj[0]
-        out_w = int(round(first_cf.crop_width * sx))
-        out_h = int(round(first_cf.crop_height * sy))
-        out_w = min(out_w, src_w)
-        out_h = min(out_h, src_h)
-        if out_w % 2 == 1:
-            out_w -= 1
-        if out_h % 2 == 1:
-            out_h -= 1
-        if out_w <= 0 or out_h <= 0:
-            out_w, out_h = src_w, src_h
-        return out_w, out_h
-
     def _on_export_clicked(self):
-        """
-        导出最终视频：弹出对话框选择格式/分辨率/路径，然后执行导出。
-        """
-        if self.state != AppState.PLAN_DONE or not self.track_engine or not self.crop_traj:
-            QMessageBox.warning(self, "无法导出", "请先完成运镜规划和预览，然后再导出视频。")
-            return
-
-        src_w = int(self.track_engine.width)
-        src_h = int(self.track_engine.height)
-        if src_w <= 0 or src_h <= 0:
-            QMessageBox.warning(self, "无法导出", "原始视频分辨率未知，无法导出。")
-            return
-
-        auto_w, auto_h = self._compute_auto_export_size()
-        if auto_w <= 0 or auto_h <= 0:
-            auto_w, auto_h = src_w, src_h
-
-        base_name = ""
-        if self.track_engine.video_path:
-            base_name = os.path.splitext(os.path.basename(self.track_engine.video_path))[0] + "_steady.mp4"
-
-        dlg = ExportDialog(
-            self,
-            src_w=src_w,
-            src_h=src_h,
-            auto_w=auto_w,
-            auto_h=auto_h,
-            default_basename=base_name,
-        )
-        if dlg.exec() != QDialog.Accepted:
-            return
-
-        out_path, mode, target_w, target_h = dlg.get_selection()
-        if not out_path:
-            return
-
-        # 真正执行导出
-        self._do_export_video(out_path, mode, target_w, target_h)
+        # TODO: 这里未来可以做“高分辨率正式导出”
+        print("Export button clicked (正式导出逻辑待实现)")
 
     def _on_play_pause_clicked(self):
         if self.state == AppState.PLAN_DONE and self.preview_cap_raw and self.preview_cap_raw.isOpened():
@@ -900,9 +644,6 @@ class MainWindow(QMainWindow):
         self.state = AppState.TRACK_DONE
         self.raw_view.clear_overlay()
         self.steady_view.clear_overlay()
-        self.export_btn.setEnabled(False)
-        self.prev_btn.setEnabled(False)
-        self.play_btn.setEnabled(False)
 
         # 读当前 UI 参数
         smooth_ui = self.control_panel.smooth_slider.value() / 100.0
@@ -947,140 +688,9 @@ class MainWindow(QMainWindow):
         self.last_click_norm = (x_norm, y_norm)
 
     def _on_export_progress(self, percent: float):
-        # 预览导出时用的进度（小视频），不走进度条，只在状态栏/overlay 里提示
+        # 更新状态栏 或者 overlay
         self.status.showMessage(f"正在导出稳像预览视频... {percent:.1f}%")
         self.steady_view.set_overlay(f"正在导出稳像预览视频... {percent:.1f}%", center=False)
-
-    def _on_final_export_progress(self, percent: float):
-        """
-        最终导出时的进度更新（0~100），驱动进度条 + overlay。
-        """
-        p = max(0.0, min(100.0, float(percent)))
-        self.export_progress.setValue(int(round(p)))
-        self.status.showMessage(f"正在导出稳像视频... {p:.1f}%")
-        self.steady_view.set_overlay(
-            f"正在导出稳像视频...\n{p:.1f}%",
-            center=True,
-            color=QColor(220, 220, 255),
-        )
-        # 强制刷新一下，防止长任务期间 UI 不重绘
-        QApplication.processEvents()
-
-    # ---------------- 最终导出逻辑 ----------------
-    def _do_export_video(self, out_path: str, mode: str, target_w: int, target_h: int):
-        """
-        真正执行导出：
-        - mode == "auto" 且目标分辨率 == 自动裁切尺寸：直接一次裁切导出
-        - 其他分辨率：先裁切出自动分辨率的小视频，然后二次 resize 到目标分辨率
-        """
-        if not self.track_engine or not self.crop_traj:
-            QMessageBox.warning(self, "导出失败", "内部状态错误，请重新打开视频后再试。")
-            return
-
-        src_video = self.track_engine.video_path
-        if not src_video or not os.path.exists(src_video):
-            QMessageBox.warning(self, "导出失败", "原始视频文件不存在，无法导出。")
-            return
-
-        auto_w, auto_h = self._compute_auto_export_size()
-        if auto_w <= 0 or auto_h <= 0:
-            auto_w, auto_h = target_w, target_h
-
-        # 进入导出状态
-        self._update_state(AppState.EXPORTING)
-
-        tmp_auto_path = None
-        try:
-            # 情况一：目标就是自动裁切分辨率，或者模式选 auto 且尺寸一致 -> 直接一次性导出
-            if mode == "auto" and target_w == auto_w and target_h == auto_h:
-                algorithm.export_stabilized_video(
-                    input_video_path=src_video,
-                    crop_frames=self.crop_traj,
-                    output_video_path=out_path,
-                    work_width=self.track_engine.scale_width,
-                    work_height=self.track_engine.scale_height,
-                    progress_cb=self._on_final_export_progress,
-                )
-            else:
-                # 情况二：需要两阶段导出 (阶段1: 自动裁切尺寸; 阶段2: resize 到目标尺寸)
-                tmp_auto_path = os.path.join(utils.get_airsteady_cache_dir(), "_export_auto_tmp.mp4")
-
-                def stage1_cb(p):
-                    self._on_final_export_progress(p * 0.5)
-
-                # 阶段1：按自动裁切分辨率导出小视频
-                algorithm.export_stabilized_video(
-                    input_video_path=src_video,
-                    crop_frames=self.crop_traj,
-                    output_video_path=tmp_auto_path,
-                    work_width=self.track_engine.scale_width,
-                    work_height=self.track_engine.scale_height,
-                    progress_cb=stage1_cb,
-                )
-
-                # 阶段2：从自动裁切小视频 resize 到用户指定分辨率
-                cap = cv2.VideoCapture(tmp_auto_path)
-                if not cap.isOpened():
-                    raise RuntimeError("无法打开临时导出文件")
-
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                if fps <= 1e-3:
-                    fps = self.track_engine.fps if self.track_engine else 25.0
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-                # 保证目标尺寸为正偶数
-                w_out = max(2, int(target_w))
-                h_out = max(2, int(target_h))
-                if w_out % 2 == 1:
-                    w_out -= 1
-                if h_out % 2 == 1:
-                    h_out -= 1
-
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(out_path, fourcc, fps, (w_out, h_out))
-                if not writer.isOpened():
-                    cap.release()
-                    raise RuntimeError("无法创建导出文件")
-
-                idx = 0
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    resized = cv2.resize(frame, (w_out, h_out), interpolation=cv2.INTER_AREA)
-                    writer.write(resized)
-                    idx += 1
-                    if total_frames > 0:
-                        percent = 50.0 + 50.0 * idx / float(total_frames)
-                    else:
-                        percent = 50.0
-                    self._on_final_export_progress(percent)
-
-                cap.release()
-                writer.release()
-
-            self._on_final_export_progress(100.0)
-            self.status.showMessage(f"导出完成: {out_path}")
-            QMessageBox.information(self, "导出完成", f"稳像视频已导出：\n{out_path}")
-            
-            # 重新支持重算轨迹
-            self._update_state(AppState.PLAN_DONE)
-            self.open_btn.setEnabled(True)
-            self.export_btn.setEnabled(True)
-            self.control_panel.recompute.setEnabled(True)
-            self.steady_view.clear_overlay()
-
-        except Exception as e:
-            self.status.showMessage(f"导出失败: {e}")
-            QMessageBox.warning(self, "导出失败", f"导出失败：{e}")
-        finally:
-            # 隐藏进度条，清理临时文件
-            self.export_progress.setVisible(False)
-            if tmp_auto_path and os.path.exists(tmp_auto_path):
-                try:
-                    os.remove(tmp_auto_path)
-                except OSError:
-                    pass
 
     # ---------------- 跟踪阶段：逐帧调用 TrackEngine ----------------
     def _on_track_obj(self):
@@ -1103,7 +713,7 @@ class MainWindow(QMainWindow):
             keep_ratio = self.control_panel.crop_slider.value() / 100.0
 
             # 映射到算法参数
-            smooth_factor = float(np.clip(1.0 - smooth_ui, 0.0, 1.0))
+            smooth_factor = float(np.clip(smooth_ui, 0.0, 1.0))
             max_crop_ratio = float(np.clip(1.0 - keep_ratio, 0.0, 0.6))
 
             print(f"smooth_factor = {smooth_factor:.3f} keep_ratio = {keep_ratio:.3f} max_crop_ratio = {max_crop_ratio:.3f}")
@@ -1111,14 +721,14 @@ class MainWindow(QMainWindow):
             # 进入 PLANNING 状态（UI 显示“正在规划运镜...”）
             self._update_state(AppState.PLANNING)
 
-            # 轨迹规划
+            # 这里先直接在主线程里算（后面你要的话可以放到 QThread 里）
             self.crop_traj = algorithm.planning_crop_traj(
                 track_result=self.track_result_all,
                 img_width=self.track_engine.scale_width,
                 img_height=self.track_engine.scale_height,
                 max_crop_ratio=max_crop_ratio,
                 smooth_factor=smooth_factor,
-                debug=False,
+                debug=False,   # 方便你调试轨迹
             )
 
             # 根据裁切结果，生成预览用的小视频
@@ -1222,13 +832,12 @@ class MainWindow(QMainWindow):
                 color=QColor(255, 200, 200),
             )
             # 至少再保留 2 秒
-            self.warn_visible_until = now + 1.0
+            self.warn_visible_until = now + 2.0
         else:
             # 没有 clamp：如果当前时间已经超过“允许清理时间”，才真正清理
             if now >= self.warn_visible_until:
                 self.steady_view.clear_overlay()
             # 否则啥也不做，让文字继续停留
-
 
     def _on_preview_tick(self):
         """预览计时器回调：同步播放原始 & 稳像小视频。"""
