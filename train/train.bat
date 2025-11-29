@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 REM ================== CONFIG ==================
 REM Conda environment name
-set "ENV_NAME=air_steady"
+set "ENV_NAME=airsteady"
 
 REM YOLO model weights
 set "MODEL=yolo11n.pt"

@@ -15,7 +15,7 @@ REM Random seed for reproducible split
 set "SEED=42"
 
 REM Conda environment name
-set "ENV_NAME=air_steady"
+set "ENV_NAME=airsteady"
 REM ============================================
 
 REM cd to current script folder

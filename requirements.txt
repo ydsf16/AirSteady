@@ -1,3 +1,6 @@
 ultralytics
 pyside6
 pyinstaller
+pyarmor
+cryptography
+# nuitka
