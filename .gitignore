@@ -211,3 +211,5 @@ train/AirSteady
 train/datasets
 train/yolo11*
 data/*
+
+yolo11*
