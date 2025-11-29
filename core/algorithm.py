@@ -13,6 +13,7 @@ from scipy.sparse.linalg import spsolve
 from ultralytics import YOLO
 
 from utils import get_airsteady_cache_dir
+from asset_loader import get_default_assets_path, load_model_and_config
 
 
 def resource_path(relative_path: str) -> str:
@@ -60,16 +61,22 @@ class TrackEngine:
         model_path: str = "model.pt",
     ):
         # 解析模型路径（默认 core/model/model.pt）
-        if not os.path.isabs(model_path):
-            model_path = resource_path(os.path.join("model", model_path))
+        # if not os.path.isabs(model_path):
+        #     model_path = resource_path(os.path.join("model", model_path))
+        # self.model_path = model_path
+        # self.tracker_cfg = resource_path(os.path.join("model", "tracker.yaml"))
+        # # YOLO 模型
+        # self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # self.model = YOLO(self.model_path)
+        # self.model.to(self.device)
 
-        self.model_path = model_path
-        self.tracker_cfg = resource_path(os.path.join("model", "tracker.yaml"))
+        # ===== 1. 从加密包中解密模型 & 配置，并加载 YOLO =====
+        enc_path = get_default_assets_path()
+        model, tracker_cfg_path, device = load_model_and_config(enc_path)
 
-        # YOLO 模型
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = YOLO(self.model_path)
-        self.model.to(self.device)
+        self.model = model
+        self.device = device
+        self.tracker_cfg = tracker_cfg_path  # 这里就是 yaml 文件路径
 
         # 视频相关属性
         self.cap: Optional[cv2.VideoCapture] = None
@@ -918,6 +925,15 @@ def _map_crop_to_full_res(
     将 CropFrame 中的中心/宽高，从工作分辨率 (work_w, work_h)
     映射到原始帧分辨率 (frame_w, frame_h)，并做边界 clamp.
     """
+
+    # 基本尺寸检查，防止除 0 或负数
+    if frame_w <= 0 or frame_h <= 0 or work_w <= 0 or work_h <= 0:
+        raise RuntimeError(
+            f"_map_crop_to_full_res: invalid size "
+            f"frame=({frame_w}x{frame_h}), work=({work_w}x{work_h})"
+        )
+
+    # 映射比例（一般 preview 时 frame == work，这里只是做保护）
     sx = frame_w / float(work_w)
     sy = frame_h / float(work_h)
 
@@ -926,14 +942,17 @@ def _map_crop_to_full_res(
     cw = cf.crop_width * sx
     ch = cf.crop_height * sy
 
-    cw_int = int(round(cw))
-    ch_int = int(round(ch))
+    # 宽高至少 1 像素
+    cw_int = max(1, int(round(cw)))
+    ch_int = max(1, int(round(ch)))
 
+    # 初始框（可能会出界）
     x1 = int(round(cx - cw / 2.0))
     y1 = int(round(cy - ch / 2.0))
     x2 = x1 + cw_int
     y2 = y1 + ch_int
 
+    # 左上越界 → 往右/下平移
     if x1 < 0:
         shift = -x1
         x1 = 0
@@ -943,6 +962,7 @@ def _map_crop_to_full_res(
         y1 = 0
         y2 = y1 + ch_int
 
+    # 右下越界 → 往左/上平移
     if x2 > frame_w:
         shift = x2 - frame_w
         x1 -= shift
@@ -956,12 +976,24 @@ def _map_crop_to_full_res(
         if y1 < 0:
             y1 = 0
 
+    # 最终 clamp 一下，并保证 x2 > x1, y2 > y1
     x1 = max(0, min(x1, frame_w - 1))
     y1 = max(0, min(y1, frame_h - 1))
     x2 = max(x1 + 1, min(x2, frame_w))
     y2 = max(y1 + 1, min(y2, frame_h))
 
+    # 再做一层 sanity check，防御性编程
+    if not (0 <= x1 < x2 <= frame_w and 0 <= y1 < y2 <= frame_h):
+        raise RuntimeError(
+            f"_map_crop_to_full_res: ROI invalid after clamp: "
+            f"x1={x1}, y1={y1}, x2={x2}, y2={y2}, "
+            f"frame=({frame_w}x{frame_h}), work=({work_w}x{work_h}), "
+            f"cf_center=({cf.crop_center_x},{cf.crop_center_y}), "
+            f"cf_size=({cf.crop_width}x{cf.crop_height})"
+        )
+
     return x1, y1, x2, y2
+
 
 
 def export_stabilized_video(
@@ -974,30 +1006,39 @@ def export_stabilized_video(
 ) -> None:
     """
     根据 crop_frames 对输入视频进行逐帧裁切，生成稳定后的视频。
+    增强版：增加了一堆防御性检查，避免 OpenCV 抛出“Unknown C++ exception”。
     """
     if not crop_frames:
         raise RuntimeError("export_stabilized_video: crop_frames is empty")
 
     cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
-        raise RuntimeError(f"Failed to open input video: {input_video_path}")
+        raise RuntimeError(f"export_stabilized_video: failed to open input video: {input_video_path}")
 
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames_cap = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    if fps <= 1e-3:
+    if frame_w <= 0 or frame_h <= 0:
+        cap.release()
+        raise RuntimeError(
+            f"export_stabilized_video: input video has invalid size "
+            f"{frame_w}x{frame_h} (path={input_video_path})"
+        )
+
+    if fps <= 1e-3 or not np.isfinite(fps):
         fps = 30.0
 
+    # 只导出两者中的最小值，防止 plan 比实际帧数多
     total_frames = min(len(crop_frames), total_frames_cap if total_frames_cap > 0 else len(crop_frames))
     if total_frames == 0:
         cap.release()
-        raise RuntimeError("export_stabilized_video: no frames to export")
+        raise RuntimeError("export_stabilized_video: no frames to export (total_frames == 0)")
 
     # 估算输出分辨率（基于第一帧裁切宽高）
-    sx = frame_w / float(work_width)
-    sy = frame_h / float(work_height)
+    sx = frame_w / float(work_width) if work_width > 0 else 1.0
+    sy = frame_h / float(work_height) if work_height > 0 else 1.0
 
     first_cf = crop_frames[0]
     out_w = int(round(first_cf.crop_width * sx))
@@ -1006,6 +1047,7 @@ def export_stabilized_video(
     out_w = min(out_w, frame_w)
     out_h = min(out_h, frame_h)
 
+    # 偶数尺寸 + 正数检查
     if out_w % 2 == 1:
         out_w -= 1
     if out_h % 2 == 1:
@@ -1013,7 +1055,12 @@ def export_stabilized_video(
 
     if out_w <= 0 or out_h <= 0 or not np.isfinite(out_w) or not np.isfinite(out_h):
         cap.release()
-        raise RuntimeError("export_stabilized_video: invalid output size")
+        raise RuntimeError(
+            f"export_stabilized_video: invalid output size "
+            f"{out_w}x{out_h}, frame={frame_w}x{frame_h}, "
+            f"work=({work_width}x{work_height}), "
+            f"first_crop=({first_cf.crop_width}x{first_cf.crop_height})"
+        )
 
     os.makedirs(os.path.dirname(output_video_path) or ".", exist_ok=True)
 
@@ -1021,17 +1068,19 @@ def export_stabilized_video(
     writer = cv2.VideoWriter(output_video_path, fourcc, fps, (out_w, out_h))
     if not writer.isOpened():
         cap.release()
-        raise RuntimeError(f"Failed to open VideoWriter: {output_video_path}")
+        raise RuntimeError(f"export_stabilized_video: failed to open VideoWriter: {output_video_path}")
 
     frame_idx = 0
     try:
         while frame_idx < total_frames:
             ret, frame = cap.read()
-            if not ret:
+            if not ret or frame is None:
+                # 提前结束，也算正常退出
                 break
 
             cf = crop_frames[frame_idx]
 
+            # 映射 ROI
             x1, y1, x2, y2 = _map_crop_to_full_res(
                 frame_w=frame_w,
                 frame_h=frame_h,
@@ -1040,10 +1089,38 @@ def export_stabilized_video(
                 cf=cf,
             )
 
+            # 再做一层 ROI 合法性校验
+            if not (0 <= x1 < x2 <= frame_w and 0 <= y1 < y2 <= frame_h):
+                raise RuntimeError(
+                    f"export_stabilized_video: ROI invalid at frame {frame_idx}: "
+                    f"x1={x1}, y1={y1}, x2={x2}, y2={y2}, "
+                    f"frame=({frame_w}x{frame_h}), work=({work_width}x{work_height}), "
+                    f"crop_center=({cf.crop_center_x},{cf.crop_center_y}), "
+                    f"crop_size=({cf.crop_width}x{cf.crop_height})"
+                )
+
             crop = frame[y1:y2, x1:x2]
+
+            if crop is None or crop.size == 0:
+                raise RuntimeError(
+                    f"export_stabilized_video: empty crop at frame {frame_idx}: "
+                    f"ROI=({x1},{y1})-({x2},{y2}), "
+                    f"frame=({frame_w}x{frame_h})"
+                )
+
             ch, cw = crop.shape[:2]
-            if cw != out_w or ch != out_h:
-                crop = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+            # resize 时捕获 OpenCV 异常，给出更完整的信息
+            try:
+                if cw != out_w or ch != out_h:
+                    crop = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA)
+            except cv2.error as e:
+                raise RuntimeError(
+                    f"export_stabilized_video: cv2.resize failed at frame {frame_idx}: {e} | "
+                    f"crop_shape=({cw}x{ch}), out=({out_w}x{out_h}), "
+                    f"ROI=({x1},{y1})-({x2},{y2}), "
+                    f"frame=({frame_w}x{frame_h}), work=({work_width}x{work_height})"
+                ) from e
 
             writer.write(crop)
             frame_idx += 1
@@ -1055,3 +1132,4 @@ def export_stabilized_video(
     finally:
         cap.release()
         writer.release()
+

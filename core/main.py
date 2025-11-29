@@ -43,6 +43,13 @@ from algorithm import TrackEngine  # 你的算法文件
 import algorithm
 import utils
 
+from license_guard import (
+    check_time_limit,
+    LicenseExpiredError,
+    ClockTamperedError,
+)
+from license_guard import EXPIRED_MESSAGE_HTML, CLOCK_TAMPERED_MESSAGE_HTML
+from version_info import get_version_info
 
 # 全局 logger，所有模块统一使用这个名字
 logger = logging.getLogger("airsteady")
@@ -664,6 +671,7 @@ class MainWindow(QMainWindow):
         # 结果缓存
         self.track_engine: TrackEngine | None = None
         self._track_engine_thread: QThread | None = None
+        self._track_engine_worker: TrackEngineInitWorker | None = None
 
          # ⭐ 新增：规划 & 预览后台线程
         self._plan_thread: QThread | None = None
@@ -685,6 +693,56 @@ class MainWindow(QMainWindow):
 
         self.warn_visible_until = 0.0
     
+    def closeEvent(self, event):
+        """窗口关闭时，确保所有后台线程和资源都被安全释放。"""
+        print("[MainWindow] closeEvent: shutting down threads...")
+
+        # 1) 停掉定时器 & 预览资源
+        try:
+            self.track_play_timer.stop()
+        except Exception:
+            pass
+
+        try:
+            self.preview_timer.stop()
+        except Exception:
+            pass
+
+        # 释放预览用 VideoCapture
+        try:
+            self._reset_preview_player()
+        except Exception:
+            pass
+
+        # 2) 停掉规划/预览线程（如果还在跑）
+        if self._plan_thread is not None:
+            try:
+                if self._plan_thread.isRunning():
+                    print("[MainWindow] stopping _plan_thread...")
+                    self._plan_thread.quit()
+                    self._plan_thread.wait()
+            except Exception as e:
+                print("[MainWindow] error while stopping _plan_thread:", e)
+            finally:
+                self._plan_thread = None
+                self._plan_worker = None
+
+        # 3) 停掉模型加载线程（如果还在跑）
+        if self._track_engine_thread is not None:
+            try:
+                if self._track_engine_thread.isRunning():
+                    print("[MainWindow] stopping _track_engine_thread...")
+                    self._track_engine_thread.quit()
+                    self._track_engine_thread.wait()
+            except Exception as e:
+                print("[MainWindow] error while stopping _track_engine_thread:", e)
+            finally:
+                self._track_engine_thread = None
+                self._track_engine_worker = None
+
+        # 4) 最后交给父类处理（真正关闭窗口）
+        super().closeEvent(event)
+
     def _on_feedback_clicked(self):
         """打开问题反馈窗口。"""
         # 确保至少已经加载过一个视频
@@ -1165,6 +1223,15 @@ class MainWindow(QMainWindow):
 
         out_path, mode, target_w, target_h = dlg.get_selection()
         if not out_path:
+            return
+        
+        try:
+            check_time_limit()
+        except LicenseExpiredError:
+            show_expired_dialog(parent=self)
+            return
+        except ClockTamperedError:
+            show_clock_tampered_dialog(parent=self)
             return
 
         # 真正执行导出（这个函数还是在主线程里，但内部有进度回调 + processEvents）
@@ -1684,12 +1751,47 @@ class MainWindow(QMainWindow):
         all_str = f"{sec_all // 60:02d}:{sec_all % 60:02d}"
         self.time_label.setText(f"{cur_str} / {all_str}")
 
+def show_expired_dialog(parent=None):
+    msg = QMessageBox(parent)
+    msg.setWindowTitle("版本已过期")
+    msg.setIcon(QMessageBox.Warning)
+    msg.setTextFormat(Qt.RichText)
+    msg.setText(EXPIRED_MESSAGE_HTML)
+    # 允许点击链接
+    msg.setTextInteractionFlags(Qt.TextBrowserInteraction)
+    msg.setStandardButtons(QMessageBox.Ok)
+    msg.exec()
+
+
+def show_clock_tampered_dialog(parent=None):
+    msg = QMessageBox(parent)
+    msg.setWindowTitle("系统时间异常")
+    msg.setIcon(QMessageBox.Critical)
+    msg.setText(
+        "检测到系统时间异常，程序已停止运行。\n\n"
+        "如果这是误报，请恢复正确时间后重试。"
+    )
+    msg.setStandardButtons(QMessageBox.Ok)
+    msg.exec()
 
 def main():
     utils.init_logging()
     logger.info("AirSteady application starting.")
+    info = get_version_info()
+    logger.info("Version %s", info.full_version_string())
 
     app = QApplication(sys.argv)
+    
+    # 先做时间限制检查
+    try:
+        check_time_limit()
+    except LicenseExpiredError:
+        show_expired_dialog(parent=None)
+        sys.exit(0)
+    except ClockTamperedError:
+        show_clock_tampered_dialog(parent=None)
+        sys.exit(0)
+
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
