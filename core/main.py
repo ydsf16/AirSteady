@@ -305,8 +305,8 @@ class ControlPanel(QWidget):
         # 裁切保留比例
         self.crop_slider = QSlider(Qt.Horizontal)
         self.crop_slider.setRange(10, 100)  # 0.1 ~ 1.0
-        self.crop_slider.setValue(80)
-        self.crop_value_label = QLabel("0.80")
+        self.crop_slider.setValue(60)
+        self.crop_value_label = QLabel("0.60")
         crop_label = QLabel("裁切保留比例")
         self.crop_left_label = QLabel("稳定优先（裁切大）")
         self.crop_right_label = QLabel("画质优先（保留多）")
@@ -429,7 +429,7 @@ class ExportDialog(QDialog):
         # --- 保存路径 ---
         path_label = QLabel("保存路径：")
         self.path_edit = QLineEdit()
-        default_dir = os.path.expanduser("~/Videos")
+        default_dir = os.path.expanduser("~/Desktop")
         if not os.path.isdir(default_dir):
             default_dir = os.path.expanduser("~")
         default_name = default_basename if default_basename else "airsteady_output.mp4"
@@ -1123,7 +1123,7 @@ class MainWindow(QMainWindow):
             self,
             "选择视频文件",
             "",
-            "Video Files (*.mp4 *.avi *.mov *.mkv)",
+            "Video Files (*.mp4 *.avi *.mov *.mkv, *.webm)",
         )
         if not path:
             return

@@ -3,11 +3,11 @@ setlocal enabledelayedexpansion
 
 REM =============== CONFIG ===============
 REM Conda environment for LabelImg
-set "ENV_NAME=labelimg_env"
+set "ENV_NAME=airsteady_gpu"
 
 REM Dataset paths
-set "IMG_DIR=E:\AirSteady\code\AirSteady\train\datasets\f16\images"
-set "LABEL_DIR=E:\AirSteady\code\AirSteady\train\datasets\f16\labels"
+set "IMG_DIR=E:\AirSteady\code\AirSteady\train\datasets\2025长春航展歼20飞行演示\images"
+set "LABEL_DIR=E:\AirSteady\code\AirSteady\train\datasets\2025长春航展歼20飞行演示\labels"
 set "CLASSES_FILE=E:\AirSteady\code\AirSteady\train\datasets\classes.txt"
 REM ======================================
 

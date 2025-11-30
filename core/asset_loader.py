@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Tuple
 
 from ultralytics import YOLO
-# import torch
+import torch
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # 和 encrypt_assets.py 中 RAW_KEY 保持完全一致
@@ -99,7 +99,7 @@ def load_model_and_config(enc_path: str):
     """
     model_path, yaml_path = materialize_assets_to_temp(enc_path)
 
-    device = "cpu" # "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     # print(f"[asset_loader] loading YOLO model from {model_path} on device={device}")
 
     model = YOLO(model_path)

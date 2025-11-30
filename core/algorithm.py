@@ -94,8 +94,8 @@ class TrackEngine:
         self.names = self.model.names  # dict: {0: 'person', 1: 'bicycle', ...}
 
         # 预览时限制最大尺寸
-        self.max_width = 2040
-        self.max_height = 2040
+        self.max_width = 1080
+        self.max_height = 1080
 
         # 跟踪结果（完整轨迹）
         self.track_results: List[TrackFrame] = []
@@ -993,7 +993,6 @@ def _map_crop_to_full_res(
         )
 
     return x1, y1, x2, y2
-
 
 
 def export_stabilized_video(

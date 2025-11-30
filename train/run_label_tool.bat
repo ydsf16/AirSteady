@@ -5,7 +5,7 @@ REM cd 到当前 bat 所在目录
 cd /d "%~dp0"
 
 REM 激活 conda 环境（要求里面已经安装：PySide6、ultralytics、labelImg）
-set "ENV_NAME=airsteady"
+set "ENV_NAME=airsteady_gpu"
 call conda activate %ENV_NAME%
 if errorlevel 1 (
     echo [ERROR] Failed to activate conda env: %ENV_NAME%

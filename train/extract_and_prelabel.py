@@ -57,7 +57,7 @@ def extract_frames(video_path: Path, images_dir: Path, skip: int) -> List[Path]:
             break
 
         if frame_idx % skip == 0:
-            out_path = images_dir / f"frame_{frame_idx:06d}.jpg"
+            out_path = images_dir / f"frame_{frame_idx:06d}.png"
             cv2.imwrite(str(out_path), frame)
             saved_paths.append(out_path)
 

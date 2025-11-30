@@ -9,13 +9,13 @@ REM 2) 抽帧间隔：比如 10 表示每隔 10 帧抽一张
 set "SKIP=10"
 
 REM 3) YOLO 预标注用的环境 / 模型配置
-set "YOLO_ENV=airsteady"
+set "YOLO_ENV=airsteady_gpu"
 set "MODEL=yolo11x.pt"
 set "IMGSZ=1024"
 set "DEVICE=0"
 
 REM 4) LabelImg 环境
-set "LABELIMG_ENV=airsteady"
+set "LABELIMG_ENV=airsteady_gpu"
 
 REM 5) 数据集根目录（预标注 + 标注结果都会放这里）
 REM    默认是当前工程下的 \datasets

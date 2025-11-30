@@ -1,16 +1,92 @@
-
-
 path: E:/AirSteady/code/AirSteady/train/datasets
 
 train:
   - hangmo/images/train
   - j15/images/train
+
+  - 2025北约老虎会｜特别涂装战机集锦实拍_split/images/train
+  - 2025北约老虎会｜葡萄牙F-16超低空对地攻击演示实录_split/images/train
+  - 2025年北约“虎式会”军演观察者日实录_split/images/train
+  - 23岁，办了一场航展_split/images/train
+  - 4升柴油只能飞5分钟，家里不开加油站都不敢玩_split/images/train
+  - AlFursan7架全新L-15在2025迪拜航展同时嚎叫！_split/images/train
+  - f16_split/images/train
   - f35_split/images/train
+  - j15_split/images/train
+  - Mirage、Rafale、F-16和Hawk在Orange的BA115空军基地起飞记录_split/images/train
+  - Noratlas的精彩表现：启动，倒车，滑行与飞行展示！_split/images/train
+  - RIAT2025史诗般离场日集锦——喷气机、巨无霸与更多精彩！_split/images/train
+  - s35_split/images/train
+  - 《大人的儿童节礼物》_split/images/train
+  - 【4K】看完发自内心的震撼！超像真歼5、歼11航模飞行致敬航空先驱_split/images/train
+  - 【4K】视觉盛宴！国内少有的极致像真F22航模震撼飞行展示_split/images/train
+  - 【别再问能不能开回家过年了】_split/images/train
+  - 【年度高燃航模剪辑】总有一个起落，让你热泪盈眶(1)_split/images/train
+  - 【年度高燃航模混剪】你，为什么飞航模？_split/images/train
+  - 中国八一飞行表演队2025全新机动动作飞行展示_split/images/train
+  - 中国空军航空大学J-10S双座战机炫技飞行｜2025长春航展_split/images/train
+  - 价值14W的SU30航模！老婆知道会打断腿的大玩具_split/images/train
+  - 列强竟是我自己！以防你没见过j10和j20编队_split/images/train
+  - 区区遥控飞机能有多牛逼？？？_split/images/train
+  - 国产航模居然做到这种程度了？！！_split/images/train
+  - 太离谱！一组对比看清歼20增升涡流多夸张！_split/images/train
+  - 媲美航展的飞行表演，F16航模超机动_split/images/train
+  - 小伙挑战100块一秒的航模su35，最后矢量喷口都没能救起_split/images/train
+  - 当F18缩小了8倍会怎样？搭载微型涡喷发动机的航模如此震撼！_split/images/train
+  - 拍了个模型，我买到真飞机的事就已经在村里传开了……_split/images/train
+  - 机是家门口起的，警报是东京响的……耗时两个月打造最像真B25航模_split/images/train
+  - 歼10没有宣传片？国内小伙竟用航模拍出来了！！！_split/images/train
+  - 民航_split/images/train
+  - 航展都见不到的冷门机型？直接全款拿下青春版！_split/images/train
+  - 运20A高难度机动展示让观众惊呼太过瘾——长春航展2025_split/images/train
+  - 这双机编队就离谱！！！_split/images/train
+  - 键盘飞行大师-f16_split/images/train
+  - 阵风战机单机表演——魔幻的暮光飞行_split/images/train
+  - 非常罕见的16比例JAS39战机航模，甚至可以锐角转弯！_split/images/train
 
 val:
   - hangmo/images/val
   - j15/images/val
+
+  - 2025北约老虎会｜特别涂装战机集锦实拍_split/images/val
+  - 2025北约老虎会｜葡萄牙F-16超低空对地攻击演示实录_split/images/val
+  - 2025年北约“虎式会”军演观察者日实录_split/images/val
+  - 23岁，办了一场航展_split/images/val
+  - 4升柴油只能飞5分钟，家里不开加油站都不敢玩_split/images/val
+  - AlFursan7架全新L-15在2025迪拜航展同时嚎叫！_split/images/val
+  - f16_split/images/val
   - f35_split/images/val
+  - j15_split/images/val
+  - Mirage、Rafale、F-16和Hawk在Orange的BA115空军基地起飞记录_split/images/val
+  - Noratlas的精彩表现：启动，倒车，滑行与飞行展示！_split/images/val
+  - RIAT2025史诗般离场日集锦——喷气机、巨无霸与更多精彩！_split/images/val
+  - s35_split/images/val
+  - 《大人的儿童节礼物》_split/images/val
+  - 【4K】看完发自内心的震撼！超像真歼5、歼11航模飞行致敬航空先驱_split/images/val
+  - 【4K】视觉盛宴！国内少有的极致像真F22航模震撼飞行展示_split/images/val
+  - 【别再问能不能开回家过年了】_split/images/val
+  - 【年度高燃航模剪辑】总有一个起落，让你热泪盈眶(1)_split/images/val
+  - 【年度高燃航模混剪】你，为什么飞航模？_split/images/val
+  - 中国八一飞行表演队2025全新机动动作飞行展示_split/images/val
+  - 中国空军航空大学J-10S双座战机炫技飞行｜2025长春航展_split/images/val
+  - 价值14W的SU30航模！老婆知道会打断腿的大玩具_split/images/val
+  - 列强竟是我自己！以防你没见过j10和j20编队_split/images/val
+  - 区区遥控飞机能有多牛逼？？？_split/images/val
+  - 国产航模居然做到这种程度了？！！_split/images/val
+  - 太离谱！一组对比看清歼20增升涡流多夸张！_split/images/val
+  - 媲美航展的飞行表演，F16航模超机动_split/images/val
+  - 小伙挑战100块一秒的航模su35，最后矢量喷口都没能救起_split/images/val
+  - 当F18缩小了8倍会怎样？搭载微型涡喷发动机的航模如此震撼！_split/images/val
+  - 拍了个模型，我买到真飞机的事就已经在村里传开了……_split/images/val
+  - 机是家门口起的，警报是东京响的……耗时两个月打造最像真B25航模_split/images/val
+  - 歼10没有宣传片？国内小伙竟用航模拍出来了！！！_split/images/val
+  - 民航_split/images/val
+  - 航展都见不到的冷门机型？直接全款拿下青春版！_split/images/val
+  - 运20A高难度机动展示让观众惊呼太过瘾——长春航展2025_split/images/val
+  - 这双机编队就离谱！！！_split/images/val
+  - 键盘飞行大师-f16_split/images/val
+  - 阵风战机单机表演——魔幻的暮光飞行_split/images/val
+  - 非常罕见的16比例JAS39战机航模，甚至可以锐角转弯！_split/images/val
 
 nc: 80
 

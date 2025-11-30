@@ -213,3 +213,4 @@ train/yolo11*
 data/*
 
 yolo11*
+build*
