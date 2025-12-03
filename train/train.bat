@@ -9,7 +9,8 @@ REM YOLO model weights
 set "MODEL=yolo11n.pt"
 
 REM Data yaml
-set "DATA_YAML=E:/AirSteady/code/AirSteady/train/full_dataset.yaml"
+@REM set "DATA_YAML=E:/AirSteady/code/AirSteady/train/full_dataset.yaml"
+set "DATA_YAML=E:/AirSteady/code/AirSteady/train/sample_dataset.yaml"
 
 REM Training hyperparameters
 set "IMG_SIZE=960"

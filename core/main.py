@@ -633,6 +633,7 @@ class PlanAndPreviewWorker(QObject):
                 work_width=self._work_width,
                 work_height=self._work_height,
                 progress_cb=_cb,
+                add_brand_watermark=False
             )
 
             print("[PlanAndPreviewWorker] export preview done.")
@@ -1469,6 +1470,7 @@ class MainWindow(QMainWindow):
                     work_width=self.track_engine.scale_width,
                     work_height=self.track_engine.scale_height,
                     progress_cb=self._on_final_export_progress,
+                    add_brand_watermark=True,
                 )
             else:
                 # 情况二：需要两阶段导出 (阶段1: 自动裁切尺寸; 阶段2: resize 到目标尺寸)
@@ -1485,6 +1487,7 @@ class MainWindow(QMainWindow):
                     work_width=self.track_engine.scale_width,
                     work_height=self.track_engine.scale_height,
                     progress_cb=stage1_cb,
+                    add_brand_watermark=True,
                 )
 
                 # 阶段2：从自动裁切小视频 resize 到用户指定分辨率

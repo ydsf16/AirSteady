@@ -94,8 +94,8 @@ class TrackEngine:
         self.names = self.model.names  # dict: {0: 'person', 1: 'bicycle', ...}
 
         # 预览时限制最大尺寸
-        self.max_width = 1080
-        self.max_height = 1080
+        self.max_width = 4000
+        self.max_height = 4000
 
         # 跟踪结果（完整轨迹）
         self.track_results: List[TrackFrame] = []
@@ -205,10 +205,28 @@ class TrackEngine:
                 (self.scale_width, self.scale_height),
                 interpolation=cv2.INTER_AREA,
             )
+        
+        vis_frame = frame.copy()
+        # -------- 在右下角打黑色码，遮住角标 --------
+        h, w = frame.shape[:2]
 
-        # 写入缩放后的视频帧到临时文件
-        if self.temp_writer is not None:
-            self.temp_writer.write(frame)
+        # 经验比例：约 10% 宽、18% 高 + 少量边距
+        logo_w_ratio = 0.10
+        logo_h_ratio = 0.18
+        margin_ratio = 0.02
+
+        logo_w = int(w * logo_w_ratio)
+        logo_h = int(h * logo_h_ratio)
+        margin_x = int(w * margin_ratio)
+        margin_y = int(h * margin_ratio)
+
+        x2 = w - margin_x
+        x1 = max(0, x2 - logo_w)
+        y2 = h - margin_y
+        y1 = max(0, y2 - logo_h)
+
+        # 直接在 frame 上画黑块，这样写入的临时视频也被打码
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), thickness=-1)
 
         # class name -> class id.
         self.target_class_name = target_class
@@ -228,9 +246,13 @@ class TrackEngine:
             verbose=False,
             device=self.device,
             tracker=self.tracker_cfg,
+            imgsz=960
         )[0]
 
-        vis_frame = frame.copy()
+        # 写入缩放后的视频帧到临时文件
+        if self.temp_writer is not None:
+            self.temp_writer.write(vis_frame)
+
         boxes = result.boxes
         selected_xywh: List[Tuple[float, float, float, float]] = []
         selected_confs: List[float] = []
@@ -1002,10 +1024,16 @@ def export_stabilized_video(
     work_width: int,
     work_height: int,
     progress_cb: Optional[Callable[[float], None]] = None,
+    add_brand_watermark: bool = False,  # ⭐ 新增：是否打“AirSteady”水印
 ) -> None:
     """
     根据 crop_frames 对输入视频进行逐帧裁切，生成稳定后的视频。
     增强版：增加了一堆防御性检查，避免 OpenCV 抛出“Unknown C++ exception”。
+
+    Args:
+        ...
+        add_brand_watermark: 若为 True，则在每一帧右下角打上
+            “稳定处理 · AirSteady「航迹稳拍」” 水印。
     """
     if not crop_frames:
         raise RuntimeError("export_stabilized_video: crop_frames is empty")
@@ -1069,6 +1097,16 @@ def export_stabilized_video(
         cap.release()
         raise RuntimeError(f"export_stabilized_video: failed to open VideoWriter: {output_video_path}")
 
+    # ⭐ 水印文字基础配置（后面按分辨率自适应缩放）
+    brand_text = "Stabilized by AirSteady"
+    font = cv2.FONT_HERSHEY_DUPLEX  # 比 SIMPLEX 好看一点
+    base_font_scale = 0.7          # 针对 1080p 设计的基准字号
+    thickness = 1
+
+    # 这里用 out_w/out_h 来预估位置，真正绘制时会拿当前帧尺寸再安全 clamp 一下
+    # text_size, baseline = cv2.getTextSize(brand_text, font, font_scale, thickness)
+    # text_w, text_h = text_size
+
     frame_idx = 0
     try:
         while frame_idx < total_frames:
@@ -1120,6 +1158,65 @@ def export_stabilized_video(
                     f"ROI=({x1},{y1})-({x2},{y2}), "
                     f"frame=({frame_w}x{frame_h}), work=({work_width}x{work_height})"
                 ) from e
+
+            # ⭐ 在这里打品牌水印（可选）
+            if add_brand_watermark:
+                h, w = crop.shape[:2]
+
+                # ---------- 根据分辨率自适应字号 ----------
+                # 以 1080p 为基准做缩放：min(w,h) / 1080
+                base = min(w, h)
+                scale = base / 1080.0
+                # 做一个 clamp，避免太小或太大
+                font_scale = max(0.5, min(1.8, base_font_scale * scale))
+
+                # 根据当前字号重新计算文字尺寸
+                (text_w, text_h), baseline = cv2.getTextSize(
+                    brand_text, font, font_scale, thickness
+                )
+
+                # margin 也按分辨率稍微缩放一下
+                margin = int(max(10, base * 0.02))  # 1080p 时大约 20 像素
+
+                # 右上角位置：x 靠右，y 靠上
+                x = max(margin, w - text_w - margin)
+                y = margin + text_h
+
+                # ---------- 半透明背景条 + 轻微描边 ----------
+                overlay = crop.copy()
+                pad_x = int(max(6, base * 0.01))
+                pad_y = int(max(4, base * 0.007))
+
+                bg_tl = (x - pad_x, y - text_h - pad_y)
+                bg_br = (x + text_w + pad_x, y + pad_y)
+                cv2.rectangle(overlay, bg_tl, bg_br, (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.4, crop, 0.6, 0, crop)
+
+                # 轻微阴影，让字在亮背景上更清晰
+                shadow_color = (0, 0, 0)
+                text_color = (255, 255, 255)
+
+                cv2.putText(
+                    crop,
+                    brand_text,
+                    (x + 1, y + 1),
+                    font,
+                    font_scale,
+                    shadow_color,
+                    thickness + 1,
+                    cv2.LINE_AA,
+                )
+
+                cv2.putText(
+                    crop,
+                    brand_text,
+                    (x, y),
+                    font,
+                    font_scale,
+                    text_color,
+                    thickness,
+                    cv2.LINE_AA,
+                )
 
             writer.write(crop)
             frame_idx += 1
