@@ -113,7 +113,9 @@ class TrackEngine:
 
         # 预览视频（缩放后）临时路径
         self.tmp_video_path = os.path.join(get_airsteady_cache_dir(), "tmp_track.mp4")
+        self.tmp_video_show_path = os.path.join(get_airsteady_cache_dir(), "tmp_track_show.mp4")
         self.temp_writer: Optional[cv2.VideoWriter] = None
+        self.temp_writer_show: Optional[cv2.VideoWriter] = None
         self.fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
         # 当前选择的类别
@@ -232,6 +234,13 @@ class TrackEngine:
             (self.scale_width, self.scale_height),
         )
 
+        self.temp_writer_show = cv2.VideoWriter(
+            self.tmp_video_show_path,
+            self.fourcc,
+            self.fps,
+            (self.scale_width, self.scale_height),
+        )
+
     def finished(self):
         """
         结束当前视频的写入和读取。
@@ -240,6 +249,11 @@ class TrackEngine:
             self.temp_writer.release()
             self.temp_writer = None
             print("finished track writter")
+        
+        if self.temp_writer_show is not None:
+            self.temp_writer_show.release()
+            self.temp_writer_show = None
+            print("finished track writter show")
 
         if self.cap is not None and self.cap.isOpened():
             self.cap.release()
@@ -381,6 +395,7 @@ class TrackEngine:
         selected_confs: List[float] = []
         selected_masks: List[Optional[np.ndarray]] = []
 
+        mask_union = None
         if boxes is not None and boxes.xywh is not None and self.target_class_id is not None:
             xywh = boxes.xywh.cpu().numpy()
             confs = boxes.conf.cpu().numpy()
@@ -390,7 +405,6 @@ class TrackEngine:
             mask_data = None
             if masks is not None and getattr(masks, "data", None) is not None:
                 mask_data = masks.data.cpu().numpy()  # (N, Hm, Wm)
-                print("has mask")
 
             for idx, ((cx, cy, w_box, h_box), conf, cls_id) in enumerate(zip(xywh, confs, cls_ids)):
                 if cls_id == self.target_class_id:
@@ -409,24 +423,36 @@ class TrackEngine:
                             m_bin = (m_resized > 0.5).astype(np.uint8)
                         else:
                             m_bin = (m > 0.5).astype(np.uint8)
+
+                        if mask_union is None:
+                            mask_union = m_bin
+                        else:
+                            mask_union |= m_bin
+                            
                         selected_masks.append(m_bin)
                     else:
                         selected_masks.append(None)
 
         num_obj = len(selected_xywh)
 
-        # --------- STEP2: 绘制角标 + 中间十字 ----------
-        colors = [
-            (0, 255, 0),
-            (0, 255, 255),
-            (255, 0, 0),
-            (255, 0, 255),
-            (255, 255, 0),
-        ]
-        line_thickness = 4
+       # --------- STEP2: 绘制锁定 HUD ----------
+
+        h_img, w_img = vis_frame.shape[:2]
+
+        # 统一用锁定绿，避免彩虹色的 debug 感
+        lock_color = (0, 255, 0)
+
+        # 线宽和长度跟分辨率成比例，保证在 1080p/4K 都好看
+        base = min(h_img, w_img)
+        line_thickness = max(2, base // 400)          # e.g. 1080p ≈ 2~3 像素
+        corner_ratio = 0.25                           # 角框占 bbox 边长的 1/4
+        cross_ratio = 0.12                            # 十字长度占 bbox 边长的 1/8 左右
+        circle_ratio = 0.10                           # 中心小圆半径
 
         for idx, (cx, cy, w_box, h_box) in enumerate(selected_xywh):
-            color = colors[idx % len(colors)]
+            # 主目标高亮，其他目标可以考虑画成灰色/细线
+            color = lock_color if idx == 0 else (120, 255, 120)
+
             x1 = int(cx - w_box / 2.0)
             y1 = int(cy - h_box / 2.0)
             x2 = int(cx + w_box / 2.0)
@@ -434,27 +460,52 @@ class TrackEngine:
 
             w_i = max(1, x2 - x1)
             h_i = max(1, y2 - y1)
-            corner_len = max(1, int(0.2 * min(w_i, h_i)))
-            cross_len = max(1, int(0.15 * min(w_i, h_i)))
+            edge = min(w_i, h_i)
 
-            # 四个角
-            cv2.line(vis_frame, (x1, y1), (x1 + corner_len, y1), color, line_thickness)
-            cv2.line(vis_frame, (x1, y1), (x1, y1 + corner_len), color, line_thickness)
+            corner_len = max(4, int(corner_ratio * edge))
+            cross_len  = max(3, int(cross_ratio * edge))
+            circle_r   = max(3, int(circle_ratio * edge))
 
-            cv2.line(vis_frame, (x2, y1), (x2 - corner_len, y1), color, line_thickness)
-            cv2.line(vis_frame, (x2, y1), (x2, y1 + corner_len), color, line_thickness)
+            # 四个角（L 型 bracket）
+            cv2.line(vis_frame, (x1, y1), (x1 + corner_len, y1),
+                     color, line_thickness, lineType=cv2.LINE_AA)
+            cv2.line(vis_frame, (x1, y1), (x1, y1 + corner_len),
+                     color, line_thickness, lineType=cv2.LINE_AA)
 
-            cv2.line(vis_frame, (x1, y2), (x1 + corner_len, y2), color, line_thickness)
-            cv2.line(vis_frame, (x1, y2), (x1, y2 - corner_len), color, line_thickness)
+            cv2.line(vis_frame, (x2, y1), (x2 - corner_len, y1),
+                     color, line_thickness, lineType=cv2.LINE_AA)
+            cv2.line(vis_frame, (x2, y1), (x2, y1 + corner_len),
+                     color, line_thickness, lineType=cv2.LINE_AA)
 
-            cv2.line(vis_frame, (x2, y2), (x2 - corner_len, y2), color, line_thickness)
-            cv2.line(vis_frame, (x2, y2), (x2, y2 - corner_len), color, line_thickness)
+            cv2.line(vis_frame, (x1, y2), (x1 + corner_len, y2),
+                     color, line_thickness, lineType=cv2.LINE_AA)
+            cv2.line(vis_frame, (x1, y2), (x1, y2 - corner_len),
+                     color, line_thickness, lineType=cv2.LINE_AA)
 
-            # 中间十字
+            cv2.line(vis_frame, (x2, y2), (x2 - corner_len, y2),
+                     color, line_thickness, lineType=cv2.LINE_AA)
+            cv2.line(vis_frame, (x2, y2), (x2, y2 - corner_len),
+                     color, line_thickness, lineType=cv2.LINE_AA)
+
+            # 中心十字 + 小圆（更像瞄准器）
             cx_i = int(cx)
             cy_i = int(cy)
-            cv2.line(vis_frame, (cx_i - cross_len, cy_i), (cx_i + cross_len, cy_i), color, line_thickness)
-            cv2.line(vis_frame, (cx_i, cy_i - cross_len), (cx_i, cy_i + cross_len), color, line_thickness)
+
+            cv2.line(vis_frame,
+                     (cx_i - cross_len, cy_i),
+                     (cx_i + cross_len, cy_i),
+                     color, line_thickness, lineType=cv2.LINE_AA)
+            cv2.line(vis_frame,
+                     (cx_i, cy_i - cross_len),
+                     (cx_i, cy_i + cross_len),
+                     color, line_thickness, lineType=cv2.LINE_AA)
+
+            cv2.circle(vis_frame,
+                       (cx_i, cy_i),
+                       circle_r,
+                       color,
+                       thickness=1,
+                       lineType=cv2.LINE_AA)
 
         # --------- STEP3: 根据检测情况重置光流参考帧（只在 num_obj == 1 时） ----------
         if num_obj == 1:
@@ -474,7 +525,7 @@ class TrackEngine:
             pts = cv2.goodFeaturesToTrack(
                 gray,
                 maxCorners=2000,
-                qualityLevel=0.01,
+                qualityLevel=0.001,
                 minDistance=1.0,
                 mask=mask_for_of,
             )
@@ -487,6 +538,23 @@ class TrackEngine:
                 self.of_prev_gray = None
                 self.of_prev_pts = None
                 self.of_tracking = False
+
+        # First write.
+        if self.temp_writer_show is not None:
+            self.temp_writer_show.write(vis_frame)
+
+        # Then show mask        
+        if mask_union is not None and mask_union.any():
+            overlay = vis_frame.astype(np.float32)
+            # 给 mask 区域上色：偏绿色
+            color = np.array([0, 255, 0], dtype=np.float32)
+            alpha = 0.6
+            mask_bool = mask_union.astype(bool)
+
+            overlay[mask_bool] = (
+                overlay[mask_bool] * (1.0 - alpha) + color * alpha
+            )
+            vis_frame = overlay.astype(np.uint8)
 
         # --------- STEP4: 组织 TrackFrame（带 delta） ----------
         if hasattr(self, "fps") and self.fps > 1e-6:
