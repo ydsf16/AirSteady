@@ -128,10 +128,12 @@ class TrackEngine:
         self.of_tracking: bool = False
 
         # 光流 RANSAC 参数（纯平移模型）
-        self.of_min_track_points: int = 50
-        self.of_ransac_threshold: float = 2.0
+        self.of_min_track_points: int = 20
+        self.of_ransac_threshold: float = 15.0
         self.of_ransac_max_iters: int = 300
-        self.of_min_inlier_ratio: float = 0.2
+        self.of_min_inlier_ratio: float = 0.00000001
+
+        self.debug_mode = False
     
     
     def estimate_translation_ransac(
@@ -179,7 +181,8 @@ class TrackEngine:
         # 对内点再做一次均值估计
         mean_dx, mean_dy = diffs[best_inliers].mean(axis=0)
         inlier_ratio = float(best_count) / float(N)
-        return True, float(mean_dx), float(mean_dy), inlier_ratio, best_inliers
+        num_inliers = best_count
+        return True, float(mean_dx), float(mean_dy), inlier_ratio, best_inliers, num_inliers
 
 
     # ------------------------------------------------------------------
@@ -225,6 +228,7 @@ class TrackEngine:
 
         # 清空旧的跟踪结果
         self.track_results.clear()
+        self.reset_optical_flow_state()
 
         # 打开临时写入器（写缩放后的视频）
         self.temp_writer = cv2.VideoWriter(
@@ -259,6 +263,8 @@ class TrackEngine:
             self.cap.release()
             self.cap = None
             print("finished track cap")
+
+        self.reset_optical_flow_state()
 
     # ------------------------------------------------------------------
     # 单步前向：读取下一帧，做 YOLO + 跟踪
@@ -325,8 +331,8 @@ class TrackEngine:
                 self.of_prev_pts,
                 None,
                 winSize=(21, 21),
-                maxLevel=3,
-                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+                maxLevel=4,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.0001),
             )
 
             if next_pts is not None and status is not None:
@@ -339,12 +345,12 @@ class TrackEngine:
                 pts2 = next_pts_flat[good_mask]
 
                 if pts1.shape[0] >= self.of_min_track_points:
-                    ok, dx, dy, inlier_ratio, inlier_mask = self.estimate_translation_ransac(
+                    ok, dx, dy, inlier_ratio, inlier_mask, num_inliers = self.estimate_translation_ransac(
                         pts1, pts2,
                         max_iters=self.of_ransac_max_iters,
                         thresh=self.of_ransac_threshold,
                     )
-                    if ok and inlier_ratio >= self.of_min_inlier_ratio:
+                    if ok and inlier_ratio >= self.of_min_inlier_ratio and num_inliers > self.of_min_track_points:
                         delta_x = dx
                         delta_y = dy
                         has_delta = True
@@ -353,11 +359,59 @@ class TrackEngine:
                         pts2_inlier = pts2[inlier_mask]
                         self.of_prev_pts = pts2_inlier.reshape(-1, 1, 2)
                         self.of_prev_gray = gray.copy()
+
+                        if self.debug_mode:
+                            # draw inlier pts as green dots on current frame
+                            for p in pts2_inlier:
+                                x, y = p
+                                cv2.circle(
+                                    vis_frame,
+                                    (int(round(x)), int(round(y))),
+                                    2,              # 半径
+                                    (0, 255, 255),    # 绿色 (B, G, R)
+                                    -1,             # 填充圆
+                                    lineType=cv2.LINE_AA,
+                                )
+
                     else:
                         # RANSAC 判定失败，停止光流
                         self.of_tracking = False
                         self.of_prev_gray = None
                         self.of_prev_pts = None
+
+                    if self.debug_mode:
+                        cv2.putText(
+                            vis_frame,
+                            str(num_inliers),          # 要画的文字
+                            (10, 60),                  # 文字左下角坐标 (x, y)
+                            cv2.FONT_HERSHEY_SIMPLEX,  # 字体
+                            1.5,                       # 字号缩放
+                            (0, 255, 0),               # 颜色 (B, G, R)
+                            2,                         # 线宽
+                            cv2.LINE_AA                # 抗锯齿
+                        )
+
+                        cv2.putText(
+                            vis_frame,
+                            str(inlier_ratio),          # 要画的文字
+                            (10, 120),                  # 文字左下角坐标 (x, y)
+                            cv2.FONT_HERSHEY_SIMPLEX,  # 字体
+                            1.5,                       # 字号缩放
+                            (0, 255, 0),               # 颜色 (B, G, R)
+                            2,                         # 线宽
+                            cv2.LINE_AA                # 抗锯齿
+                        )
+
+                        cv2.putText(
+                            vis_frame,
+                            str(pts1.shape[0]),          # 要画的文字
+                            (10, 180),                  # 文字左下角坐标 (x, y)
+                            cv2.FONT_HERSHEY_SIMPLEX,  # 字体
+                            1.5,                       # 字号缩放
+                            (0, 255, 0),               # 颜色 (B, G, R)
+                            2,                         # 线宽
+                            cv2.LINE_AA                # 抗锯齿
+                        )
                 else:
                     # 可用点太少
                     self.of_tracking = False
@@ -524,9 +578,9 @@ class TrackEngine:
 
             pts = cv2.goodFeaturesToTrack(
                 gray,
-                maxCorners=2000,
+                maxCorners=500,
                 qualityLevel=0.001,
-                minDistance=1.0,
+                minDistance=2.0,
                 mask=mask_for_of,
             )
 
@@ -539,22 +593,23 @@ class TrackEngine:
                 self.of_prev_pts = None
                 self.of_tracking = False
 
+        # Then show mask
+        if self.debug_mode:        
+            if mask_union is not None and mask_union.any():
+                overlay = vis_frame.astype(np.float32)
+                # 给 mask 区域上色：偏绿色
+                color = np.array([0, 255, 0], dtype=np.float32)
+                alpha = 0.6
+                mask_bool = mask_union.astype(bool)
+
+                overlay[mask_bool] = (
+                    overlay[mask_bool] * (1.0 - alpha) + color * alpha
+                )
+                vis_frame = overlay.astype(np.uint8)
+
         # First write.
         if self.temp_writer_show is not None:
             self.temp_writer_show.write(vis_frame)
-
-        # Then show mask        
-        if mask_union is not None and mask_union.any():
-            overlay = vis_frame.astype(np.float32)
-            # 给 mask 区域上色：偏绿色
-            color = np.array([0, 255, 0], dtype=np.float32)
-            alpha = 0.6
-            mask_bool = mask_union.astype(bool)
-
-            overlay[mask_bool] = (
-                overlay[mask_bool] * (1.0 - alpha) + color * alpha
-            )
-            vis_frame = overlay.astype(np.uint8)
 
         # --------- STEP4: 组织 TrackFrame（带 delta） ----------
         if hasattr(self, "fps") and self.fps > 1e-6:
@@ -598,7 +653,11 @@ class TrackEngine:
         self.track_results.append(track_frame)
         return vis_frame, track_frame
 
-
+    def reset_optical_flow_state(self) -> None:
+        """Reset optical flow tracking and related state."""
+        self.of_tracking = False
+        self.of_prev_gray = None
+        self.of_prev_pts = None
 
 # ======================================================================
 # 裁切轨迹规划部分

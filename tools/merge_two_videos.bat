@@ -3,7 +3,7 @@ setlocal enabledelayedexpansion
 
 REM =============== CONFIG ===============
 REM Dataset paths
-set "VIDEO1=C:\Users\ydsf1\AppData\Local\AirSteady\cache\tmp_track.mp4"
+set "VIDEO1=C:\Users\ydsf1\AppData\Local\AirSteady\cache\tmp_track_show.mp4"
 set "VIDEO2=C:\Users\ydsf1\AppData\Local\AirSteady\cache\tmp_crop.mp4"
 
 REM 输出目录（不用写文件名，只写文件夹）
