@@ -46,6 +46,11 @@ class TrackFrame:
     valid: bool       # 是否是“唯一目标”的有效观测
     num_obj: int      # 当前帧该类别目标数量
 
+    # 新增：光流估计的帧间位移（当前帧相对上一帧）
+    dx: float = float("nan")
+    dy: float = float("nan")
+    has_delta: bool = False   # True 表示 dx, dy 有效
+
 
 class TrackEngine:
     """
@@ -74,7 +79,7 @@ class TrackEngine:
         enc_path = get_default_assets_path()
         model, tracker_cfg_path, device = load_model_and_config(enc_path)
 
-        self.model = model
+        self.model = YOLO("yolo11s-seg.pt")
         self.device = device
         self.tracker_cfg = tracker_cfg_path  # 这里就是 yaml 文件路径
 
@@ -94,8 +99,8 @@ class TrackEngine:
         self.names = self.model.names  # dict: {0: 'person', 1: 'bicycle', ...}
 
         # 预览时限制最大尺寸
-        self.max_width = 4000
-        self.max_height = 4000
+        self.max_width = 2000
+        self.max_height = 2000
 
         # 跟踪结果（完整轨迹）
         self.track_results: List[TrackFrame] = []
@@ -114,6 +119,66 @@ class TrackEngine:
         # 当前选择的类别
         self.target_class_name: str = "airplane"
         self.target_class_id: Optional[int] = None
+
+        # ---------- 光流跟踪状态 ----------
+        self.of_prev_gray: Optional[np.ndarray] = None
+        self.of_prev_pts: Optional[np.ndarray] = None  # 形状 (N, 1, 2)
+        self.of_tracking: bool = False
+
+        # 光流 RANSAC 参数（纯平移模型）
+        self.of_min_track_points: int = 50
+        self.of_ransac_threshold: float = 2.0
+        self.of_ransac_max_iters: int = 300
+        self.of_min_inlier_ratio: float = 0.2
+    
+    
+    def estimate_translation_ransac(
+        self,
+        pts1: np.ndarray,
+        pts2: np.ndarray,
+        max_iters: int = 300,
+        thresh: float = 2.0,
+    ) -> Tuple[bool, float, float, float, np.ndarray]:
+        """
+        估计二维纯平移：p2 = p1 + t，通过 RANSAC 拟合 t = (dx, dy).
+
+        Args:
+            pts1, pts2: 形状 (N, 2)，对应光流匹配点.
+        Returns:
+            ok: 是否成功
+            dx, dy: 平移
+            inlier_ratio: 内点比例
+            inlier_mask: bool 数组，长度 N
+        """
+        assert pts1.shape == pts2.shape
+        N = pts1.shape[0]
+        if N < 5:
+            return False, 0.0, 0.0, 0.0, np.zeros(N, dtype=bool)
+
+        diffs = pts2 - pts1  # (N, 2)
+        best_inliers = np.zeros(N, dtype=bool)
+        best_count = 0
+        best_dx, best_dy = 0.0, 0.0
+
+        for _ in range(max_iters):
+            idx = np.random.randint(0, N)
+            dx0, dy0 = diffs[idx]
+            residuals = np.linalg.norm(diffs - np.array([dx0, dy0]), axis=1)
+            inliers = residuals < thresh
+            cnt = int(inliers.sum())
+            if cnt > best_count:
+                best_count = cnt
+                best_inliers = inliers
+                best_dx, best_dy = dx0, dy0
+
+        if best_count == 0:
+            return False, 0.0, 0.0, 0.0, best_inliers
+
+        # 对内点再做一次均值估计
+        mean_dx, mean_dy = diffs[best_inliers].mean(axis=0)
+        inlier_ratio = float(best_count) / float(N)
+        return True, float(mean_dx), float(mean_dy), inlier_ratio, best_inliers
+
 
     # ------------------------------------------------------------------
     # 打开视频
@@ -186,7 +251,8 @@ class TrackEngine:
     # ------------------------------------------------------------------
     def next_frame(self, target_class: str = "airplane") -> Tuple[Optional[np.ndarray], Optional[TrackFrame]]:
         """
-        读取下一帧并处理（用于在线预览）。
+        读取下一帧并处理（用于在线预览）.
+
         返回:
             vis_frame: 已绘制角标/十字的 BGR 图像
             track_frame: TrackFrame 或 None
@@ -195,7 +261,7 @@ class TrackEngine:
             return None, None
 
         success, frame = self.cap.read()
-        if not success:
+        if not success or frame is None:
             return None, None
 
         # 缩放到工作分辨率
@@ -205,12 +271,11 @@ class TrackEngine:
                 (self.scale_width, self.scale_height),
                 interpolation=cv2.INTER_AREA,
             )
-        
+
         vis_frame = frame.copy()
-        # -------- 在右下角打黑色码，遮住角标 --------
         h, w = frame.shape[:2]
 
-        # 经验比例：约 10% 宽、18% 高 + 少量边距
+        # 在右下角打黑块，遮住角标（写入 temp 视频使用）
         logo_w_ratio = 0.10
         logo_h_ratio = 0.18
         margin_ratio = 0.02
@@ -225,10 +290,71 @@ class TrackEngine:
         y2 = h - margin_y
         y1 = max(0, y2 - logo_h)
 
-        # 直接在 frame 上画黑块，这样写入的临时视频也被打码
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), thickness=-1)
 
-        # class name -> class id.
+        # 灰度图（光流用）
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # 当前帧索引（0-based）
+        self.current_frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+
+        # --------- STEP0: 使用上一帧状态做光流，估计 delta ----------
+        delta_x = float("nan")
+        delta_y = float("nan")
+        has_delta = False
+
+        if self.of_tracking and self.of_prev_gray is not None and self.of_prev_pts is not None:
+            # Lucas-Kanade 金字塔光流
+            next_pts, status, err = cv2.calcOpticalFlowPyrLK(
+                self.of_prev_gray,
+                gray,
+                self.of_prev_pts,
+                None,
+                winSize=(21, 21),
+                maxLevel=3,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+            )
+
+            if next_pts is not None and status is not None:
+                status = status.reshape(-1)
+                prev_pts_flat = self.of_prev_pts.reshape(-1, 2)
+                next_pts_flat = next_pts.reshape(-1, 2)
+
+                good_mask = (status == 1)
+                pts1 = prev_pts_flat[good_mask]
+                pts2 = next_pts_flat[good_mask]
+
+                if pts1.shape[0] >= self.of_min_track_points:
+                    ok, dx, dy, inlier_ratio, inlier_mask = self.estimate_translation_ransac(
+                        pts1, pts2,
+                        max_iters=self.of_ransac_max_iters,
+                        thresh=self.of_ransac_threshold,
+                    )
+                    if ok and inlier_ratio >= self.of_min_inlier_ratio:
+                        delta_x = dx
+                        delta_y = dy
+                        has_delta = True
+
+                        # 只保留内点，更新状态
+                        pts2_inlier = pts2[inlier_mask]
+                        self.of_prev_pts = pts2_inlier.reshape(-1, 1, 2)
+                        self.of_prev_gray = gray.copy()
+                    else:
+                        # RANSAC 判定失败，停止光流
+                        self.of_tracking = False
+                        self.of_prev_gray = None
+                        self.of_prev_pts = None
+                else:
+                    # 可用点太少
+                    self.of_tracking = False
+                    self.of_prev_gray = None
+                    self.of_prev_pts = None
+            else:
+                self.of_tracking = False
+                self.of_prev_gray = None
+                self.of_prev_pts = None
+
+        # --------- STEP1: YOLO 检测（每帧都跑） ----------
         self.target_class_name = target_class
         self.target_class_id = None
         for i, name in self.names.items():
@@ -236,41 +362,60 @@ class TrackEngine:
                 self.target_class_id = int(i)
                 break
 
-        # 当前帧索引（0-based）
-        self.current_frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-
-        # YOLO 跟踪（persist=True 保留 track id）
         result = self.model.track(
             frame,
             persist=True,
             verbose=False,
             device=self.device,
             tracker=self.tracker_cfg,
-            imgsz=960
+            imgsz=960,
         )[0]
 
-        # 写入缩放后的视频帧到临时文件
+        # 写入缩放后的视频帧到临时文件（可视化时用的是 vis_frame，而不是打码后的 frame）
         if self.temp_writer is not None:
             self.temp_writer.write(vis_frame)
 
         boxes = result.boxes
+        masks = getattr(result, "masks", None)  # YOLOv11-seg 时可能存在
         selected_xywh: List[Tuple[float, float, float, float]] = []
         selected_confs: List[float] = []
+        selected_masks: List[Optional[np.ndarray]] = []
 
-        # ---------- STEP1: 提取指定类别的 bbox + conf ----------
         if boxes is not None and boxes.xywh is not None and self.target_class_id is not None:
             xywh = boxes.xywh.cpu().numpy()
             confs = boxes.conf.cpu().numpy()
             cls_ids = boxes.cls.int().cpu().numpy()
 
-            for (cx, cy, w_box, h_box), conf, cls_id in zip(xywh, confs, cls_ids):
+            # seg mask 数据（如果有）
+            mask_data = None
+            if masks is not None and getattr(masks, "data", None) is not None:
+                mask_data = masks.data.cpu().numpy()  # (N, Hm, Wm)
+                print("has mask")
+
+            for idx, ((cx, cy, w_box, h_box), conf, cls_id) in enumerate(zip(xywh, confs, cls_ids)):
                 if cls_id == self.target_class_id:
                     selected_xywh.append((float(cx), float(cy), float(w_box), float(h_box)))
                     selected_confs.append(float(conf))
 
+                    if mask_data is not None and idx < mask_data.shape[0]:
+                        m = mask_data[idx]
+                        # 转成 uint8 mask，必要时 resize 到当前帧尺寸
+                        if m.shape != gray.shape:
+                            m_resized = cv2.resize(
+                                m.astype(np.float32),
+                                (w, h),
+                                interpolation=cv2.INTER_NEAREST,
+                            )
+                            m_bin = (m_resized > 0.5).astype(np.uint8)
+                        else:
+                            m_bin = (m > 0.5).astype(np.uint8)
+                        selected_masks.append(m_bin)
+                    else:
+                        selected_masks.append(None)
+
         num_obj = len(selected_xywh)
 
-        # ---------- STEP2: 绘制角标 + 中间十字 ----------
+        # --------- STEP2: 绘制角标 + 中间十字 ----------
         colors = [
             (0, 255, 0),
             (0, 255, 255),
@@ -311,7 +456,39 @@ class TrackEngine:
             cv2.line(vis_frame, (cx_i - cross_len, cy_i), (cx_i + cross_len, cy_i), color, line_thickness)
             cv2.line(vis_frame, (cx_i, cy_i - cross_len), (cx_i, cy_i + cross_len), color, line_thickness)
 
-        # ---------- STEP3: 组织 TrackFrame ----------
+        # --------- STEP3: 根据检测情况重置光流参考帧（只在 num_obj == 1 时） ----------
+        if num_obj == 1:
+            cx, cy, w_box, h_box = selected_xywh[0]
+
+            # 选一个 mask：优先用语义 mask，退化到 bbox
+            mask_for_of = np.zeros_like(gray, dtype=np.uint8)
+            if selected_masks and selected_masks[0] is not None:
+                mask_for_of = (selected_masks[0] > 0).astype(np.uint8) * 255
+            else:
+                x1 = int(max(0, cx - w_box / 2.0))
+                y1 = int(max(0, cy - h_box / 2.0))
+                x2 = int(min(w - 1, cx + w_box / 2.0))
+                y2 = int(min(h - 1, cy + h_box / 2.0))
+                mask_for_of[y1:y2, x1:x2] = 255
+
+            pts = cv2.goodFeaturesToTrack(
+                gray,
+                maxCorners=2000,
+                qualityLevel=0.01,
+                minDistance=1.0,
+                mask=mask_for_of,
+            )
+
+            if pts is not None and pts.shape[0] >= self.of_min_track_points:
+                self.of_prev_gray = gray.copy()
+                self.of_prev_pts = pts.reshape(-1, 1, 2)
+                self.of_tracking = True
+            else:
+                self.of_prev_gray = None
+                self.of_prev_pts = None
+                self.of_tracking = False
+
+        # --------- STEP4: 组织 TrackFrame（带 delta） ----------
         if hasattr(self, "fps") and self.fps > 1e-6:
             timestamp = float(self.current_frame_idx / self.fps)
         else:
@@ -330,9 +507,11 @@ class TrackEngine:
                 conf=conf,
                 valid=True,
                 num_obj=num_obj,
+                dx=delta_x,
+                dy=delta_y,
+                has_delta=bool(has_delta),
             )
         else:
-            # 0 个 或 >1 个目标 → 视为无效（保持画面，但不用于后续规划）
             track_frame = TrackFrame(
                 timestamp=timestamp,
                 frame_idx=self.current_frame_idx,
@@ -343,10 +522,14 @@ class TrackEngine:
                 conf=0.0,
                 valid=False,
                 num_obj=num_obj,
+                dx=delta_x,
+                dy=delta_y,
+                has_delta=bool(has_delta),
             )
 
         self.track_results.append(track_frame)
         return vis_frame, track_frame
+
 
 
 # ======================================================================
@@ -856,78 +1039,120 @@ def planning_crop_traj(
     img_width: int,
     img_height: int,
     max_crop_ratio: float,
-    smooth_factor: float = 0.5,
+    smooth_factor: float = 0.5,  # 保留参数占位
     debug: bool = False,
 ) -> List[CropFrame]:
     """
-    规划整段视频的裁切轨迹（工作分辨率下）.
+    简化版裁切规划（delta 积分版）.
+
+    逻辑：
+    1) 默认所有帧的裁切中心 = 图像正中间。
+    2) 对于 has_delta 连续的段落：
+       - 以该段的第一帧为基准帧：
+         center[s] = 基准帧的检测中心（若无则用图像中心）
+         后续帧中心 = 前一帧中心 + delta（逐帧累加）
+    3) 不在任何 delta 连续段内的帧，一律保持图像中心。
+    4) 裁切宽高由 max_crop_ratio 决定（不再做全局优化）。
     """
     if not track_result:
         return []
 
-    ctx = build_observations_and_weights(
-        track_result=track_result,
-        img_width=img_width,
-        img_height=img_height,
-        max_crop_ratio=max_crop_ratio,
-    )
+    n = len(track_result)
+    W = float(img_width)
+    H = float(img_height)
 
-    timestamps = ctx["timestamps"]
-    frame_idx = ctx["frame_idx"]
-    cx_raw = ctx["cx_raw"]
-    cy_raw = ctx["cy_raw"]
-    obs_cx = ctx["obs_cx"]
-    obs_cy = ctx["obs_cy"]
-    weights = ctx["weights"]
-    real_effective_mask = ctx["real_effective_mask"]
-    W = ctx["W"]
-    H = ctx["H"]
+    timestamps = np.array([f.timestamp for f in track_result], dtype=float)
+    frame_idx_arr = np.array([f.frame_idx for f in track_result], dtype=int)
+    cx_det = np.array([f.cx for f in track_result], dtype=float)
+    cy_det = np.array([f.cy for f in track_result], dtype=float)
+    valid_det = np.array([f.valid for f in track_result], dtype=bool)
+    dx_arr = np.array([f.dx for f in track_result], dtype=float)
+    dy_arr = np.array([f.dy for f in track_result], dtype=float)
+    has_delta_arr = np.array([f.has_delta for f in track_result], dtype=bool)
 
-    # Step3: Huber + 五对角平滑
-    px, py = solve_smooth_trajectory(
-        obs_cx=obs_cx,
-        obs_cy=obs_cy,
-        weights=weights,
-        smooth_factor=smooth_factor,
-        huber_delta=10.0,
-    )
+    # 1) 默认所有帧中心 = 图像中心
+    center_x = np.full(n, W / 2.0, dtype=float)
+    center_y = np.full(n, H / 2.0, dtype=float)
 
-    # Step2: 计算全局裁切比例（只用真实有效观测）
-    crop_ratio = compute_global_crop_ratio(
-        px=px,
-        py=py,
-        W=W,
-        H=H,
-        max_crop_ratio=max_crop_ratio,
-        effective_mask=real_effective_mask,
-    )
+    # 2) 找连续 has_delta 段落，做积分
+    # 注意：has_delta[i] 表示 i 与 i-1 之间有 delta
+    i = 1
+    while i < n:
+        # 段落开始条件：当前帧有 delta，且前一帧没有（或 i == 1）
+        if not has_delta_arr[i] or (i > 1 and has_delta_arr[i - 1]):
+            i += 1
+            continue
 
-    # Step4: 构造 per-frame CropFrame
-    crop_frames = build_crop_frames(
-        timestamps=timestamps,
-        frame_idx=frame_idx,
-        px=px,
-        py=py,
-        W=W,
-        H=H,
-        crop_ratio=crop_ratio,
-        effective_mask=real_effective_mask,
-    )
+        base = i - 1  # 段落的第一帧（无 delta，作为 ref）
+        # 基准中心：优先用该帧的检测中心
+        if valid_det[base]:
+            ref_cx = cx_det[base]
+            ref_cy = cy_det[base]
+        else:
+            ref_cx = W / 2.0
+            ref_cy = H / 2.0
 
-    if debug:
-        plot_planning_debug(
-            timestamps=timestamps,
-            cx_raw=cx_raw,
-            cy_raw=cy_raw,
-            obs_cx=obs_cx,
-            obs_cy=obs_cy,
-            px=px,
-            py=py,
-            effective_mask=real_effective_mask,
-            W=W,
-            H=H,
-            crop_ratio=crop_ratio,
+        center_x[base] = ref_cx
+        center_y[base] = ref_cy
+
+        j = i
+        prev_cx = ref_cx
+        prev_cy = ref_cy
+
+        while j < n and has_delta_arr[j]:
+            dx = dx_arr[j]
+            dy = dy_arr[j]
+            if not np.isfinite(dx) or not np.isfinite(dy):
+                break
+            prev_cx = prev_cx + dx
+            prev_cy = prev_cy + dy
+            center_x[j] = prev_cx
+            center_y[j] = prev_cy
+            j += 1
+
+        # 你如果希望“短段落”直接丢弃，可以在这里判断段长 j-base
+        # 目前不做最小长度限制，完全按 delta 连续性来。
+
+        i = j + 1
+
+    # 3) 根据 max_crop_ratio 决定裁切宽高（简单映射）
+    crop_ratio = float(np.clip(max_crop_ratio, 0.0, 0.9))
+    crop_width = W * (1.0 - crop_ratio)
+    crop_height = H * (1.0 - crop_ratio)
+
+    crop_frames: List[CropFrame] = []
+    for k in range(n):
+        crop_frames.append(
+            CropFrame(
+                timestamp=float(timestamps[k]),
+                frame_idx=int(frame_idx_arr[k]),
+                crop_center_x=float(center_x[k]),
+                crop_center_y=float(center_y[k]),
+                crop_width=float(crop_width),
+                crop_height=float(crop_height),
+                scale=1.0,
+                clamp=False,   # 不再做 clamp，黑边交给导出函数处理
+            )
         )
+
+    # debug 可视化简单画一下 center_x/center_y
+    if debug:
+        try:
+            import matplotlib.pyplot as plt
+            t = timestamps
+            plt.figure(figsize=(10, 4))
+            plt.subplot(2, 1, 1)
+            plt.title("Center X with delta integration")
+            plt.plot(t, center_x, "r-")
+            plt.axhline(W / 2.0, color="gray", linestyle="--")
+            plt.subplot(2, 1, 2)
+            plt.title("Center Y with delta integration")
+            plt.plot(t, center_y, "b-")
+            plt.axhline(H / 2.0, color="gray", linestyle="--")
+            plt.tight_layout()
+            plt.show()
+        except Exception as e:
+            print(f"[planning debug] matplotlib not available: {e}")
 
     return crop_frames
 
@@ -1117,115 +1342,99 @@ def export_stabilized_video(
 
             cf = crop_frames[frame_idx]
 
-            # 映射 ROI
-            x1, y1, x2, y2 = _map_crop_to_full_res(
-                frame_w=frame_w,
-                frame_h=frame_h,
-                work_w=work_width,
-                work_h=work_height,
-                cf=cf,
-            )
+            # ========== 新版：根据中心做平移 + 黑边 ==========
+            # work 坐标 -> 原图坐标
+            sx = frame_w / float(work_width) if work_width > 0 else 1.0
+            sy = frame_h / float(work_height) if work_height > 0 else 1.0
 
-            # 再做一层 ROI 合法性校验
-            if not (0 <= x1 < x2 <= frame_w and 0 <= y1 < y2 <= frame_h):
-                raise RuntimeError(
-                    f"export_stabilized_video: ROI invalid at frame {frame_idx}: "
-                    f"x1={x1}, y1={y1}, x2={x2}, y2={y2}, "
-                    f"frame=({frame_w}x{frame_h}), work=({work_width}x{work_height}), "
-                    f"crop_center=({cf.crop_center_x},{cf.crop_center_y}), "
-                    f"crop_size=({cf.crop_width}x{cf.crop_height})"
-                )
+            cx_full = float(cf.crop_center_x) * sx
+            cy_full = float(cf.crop_center_y) * sy
 
-            crop = frame[y1:y2, x1:x2]
+            # 目标输出帧中心
+            dst_cx = out_w / 2.0
+            dst_cy = out_h / 2.0
 
-            if crop is None or crop.size == 0:
-                raise RuntimeError(
-                    f"export_stabilized_video: empty crop at frame {frame_idx}: "
-                    f"ROI=({x1},{y1})-({x2},{y2}), "
-                    f"frame=({frame_w}x{frame_h})"
-                )
+            dx = dst_cx - cx_full
+            dy = dst_cy - cy_full
 
-            ch, cw = crop.shape[:2]
+            M = np.float32([[1.0, 0.0, dx],
+                            [0.0, 1.0, dy]])
 
-            # resize 时捕获 OpenCV 异常，给出更完整的信息
+            # 平移 + 黑边填充
             try:
-                if cw != out_w or ch != out_h:
-                    crop = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                crop = cv2.warpAffine(
+                    frame,
+                    M,
+                    (out_w, out_h),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(0, 0, 0),
+                )
             except cv2.error as e:
                 raise RuntimeError(
-                    f"export_stabilized_video: cv2.resize failed at frame {frame_idx}: {e} | "
-                    f"crop_shape=({cw}x{ch}), out=({out_w}x{out_h}), "
-                    f"ROI=({x1},{y1})-({x2},{y2}), "
+                    f"export_stabilized_video: cv2.warpAffine failed at frame {frame_idx}: {e} | "
+                    f"center=({cx_full},{cy_full}), out=({out_w}x{out_h}), "
                     f"frame=({frame_w}x{frame_h}), work=({work_width}x{work_height})"
                 ) from e
 
-            # ⭐ 在这里打品牌水印（可选）
+            # ========= 打水印逻辑保持不变 =========
             if add_brand_watermark:
-                h, w = crop.shape[:2]
+                h2, w2 = crop.shape[:2]
 
-                # ---------- 根据分辨率自适应字号 ----------
-                # 以 1080p 为基准做缩放：min(w,h) / 1080
-                base = min(w, h)
+                base = min(w2, h2)
                 scale = base / 1080.0
-                # 做一个 clamp，避免太小或太大
                 font_scale = max(0.5, min(1.8, base_font_scale * scale))
 
-                # 根据当前字号重新计算文字尺寸
                 (text_w, text_h), baseline = cv2.getTextSize(
                     brand_text, font, font_scale, thickness
                 )
 
-                # margin 也按分辨率稍微缩放一下
-                margin = int(max(10, base * 0.02))  # 1080p 时大约 20 像素
+                margin = int(max(10, base * 0.02))
+                x_txt = max(margin, w2 - text_w - margin)
+                y_txt = margin + text_h
 
-                # 右上角位置：x 靠右，y 靠上
-                x = max(margin, w - text_w - margin)
-                y = margin + text_h
-
-                # ---------- 半透明背景条 + 轻微描边 ----------
                 overlay = crop.copy()
                 pad_x = int(max(6, base * 0.01))
                 pad_y = int(max(4, base * 0.007))
 
-                bg_tl = (x - pad_x, y - text_h - pad_y)
-                bg_br = (x + text_w + pad_x, y + pad_y)
+                bg_tl = (x_txt - pad_x, y_txt - text_h - pad_y)
+                bg_br = (x_txt + text_w + pad_x, y_txt + pad_y)
                 cv2.rectangle(overlay, bg_tl, bg_br, (0, 0, 0), -1)
                 cv2.addWeighted(overlay, 0.4, crop, 0.6, 0, crop)
 
-                # 轻微阴影，让字在亮背景上更清晰
                 shadow_color = (0, 0, 0)
                 text_color = (255, 255, 255)
 
                 cv2.putText(
                     crop,
                     brand_text,
-                    (x + 1, y + 1),
+                    (x_txt + 1, y_txt + 1),
                     font,
                     font_scale,
                     shadow_color,
                     thickness + 1,
-                    cv2.LINE_AA,
+                    lineType=cv2.LINE_AA,
                 )
-
                 cv2.putText(
                     crop,
                     brand_text,
-                    (x, y),
+                    (x_txt, y_txt),
                     font,
                     font_scale,
                     text_color,
                     thickness,
-                    cv2.LINE_AA,
+                    lineType=cv2.LINE_AA,
                 )
 
             writer.write(crop)
+
             frame_idx += 1
 
             if progress_cb is not None:
-                percent = 100.0 * frame_idx / float(total_frames)
-                progress_cb(percent)
+                progress_cb(100.0 * frame_idx / float(max(1, total_frames)))
 
     finally:
         cap.release()
         writer.release()
+
 
