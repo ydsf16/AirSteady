@@ -99,8 +99,8 @@ class TrackEngine:
         self.names = self.model.names  # dict: {0: 'person', 1: 'bicycle', ...}
 
         # 预览时限制最大尺寸
-        self.max_width = 2000
-        self.max_height = 2000
+        self.max_width  = 4000
+        self.max_height = 4000
 
         # 跟踪结果（完整轨迹）
         self.track_results: List[TrackFrame] = []
@@ -129,11 +129,13 @@ class TrackEngine:
 
         # 光流 RANSAC 参数（纯平移模型）
         self.of_min_track_points: int = 20
-        self.of_ransac_threshold: float = 15.0
+        self.of_ransac_threshold: float = 5.0
         self.of_ransac_max_iters: int = 300
         self.of_min_inlier_ratio: float = 0.00000001
 
         self.debug_mode = False
+
+        self.det_interval = 2
     
     
     def estimate_translation_ransac(
@@ -318,10 +320,16 @@ class TrackEngine:
         # 当前帧索引（0-based）
         self.current_frame_idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
 
+        # [NEW] YOLO 检测间隔（默认每 5 帧跑一次，可以在外部设置 self.det_interval）
+        det_interval = getattr(self, "det_interval", 5)
+        run_detection = (self.current_frame_idx % det_interval == 0)
+
         # --------- STEP0: 使用上一帧状态做光流，估计 delta ----------
         delta_x = float("nan")
         delta_y = float("nan")
         has_delta = False
+        num_inliers = 0
+        inlier_ratio = 0.0
 
         if self.of_tracking and self.of_prev_gray is not None and self.of_prev_pts is not None:
             # Lucas-Kanade 金字塔光流
@@ -367,9 +375,9 @@ class TrackEngine:
                                 cv2.circle(
                                     vis_frame,
                                     (int(round(x)), int(round(y))),
-                                    2,              # 半径
-                                    (0, 255, 255),    # 绿色 (B, G, R)
-                                    -1,             # 填充圆
+                                    2,
+                                    (0, 255, 255),
+                                    -1,
                                     lineType=cv2.LINE_AA,
                                 )
 
@@ -382,35 +390,35 @@ class TrackEngine:
                     if self.debug_mode:
                         cv2.putText(
                             vis_frame,
-                            str(num_inliers),          # 要画的文字
-                            (10, 60),                  # 文字左下角坐标 (x, y)
-                            cv2.FONT_HERSHEY_SIMPLEX,  # 字体
-                            1.5,                       # 字号缩放
-                            (0, 255, 0),               # 颜色 (B, G, R)
-                            2,                         # 线宽
-                            cv2.LINE_AA                # 抗锯齿
+                            str(num_inliers),
+                            (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1.5,
+                            (0, 255, 0),
+                            2,
+                            cv2.LINE_AA,
                         )
 
                         cv2.putText(
                             vis_frame,
-                            str(inlier_ratio),          # 要画的文字
-                            (10, 120),                  # 文字左下角坐标 (x, y)
-                            cv2.FONT_HERSHEY_SIMPLEX,  # 字体
-                            1.5,                       # 字号缩放
-                            (0, 255, 0),               # 颜色 (B, G, R)
-                            2,                         # 线宽
-                            cv2.LINE_AA                # 抗锯齿
+                            str(inlier_ratio),
+                            (10, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1.5,
+                            (0, 255, 0),
+                            2,
+                            cv2.LINE_AA,
                         )
 
                         cv2.putText(
                             vis_frame,
-                            str(pts1.shape[0]),          # 要画的文字
-                            (10, 180),                  # 文字左下角坐标 (x, y)
-                            cv2.FONT_HERSHEY_SIMPLEX,  # 字体
-                            1.5,                       # 字号缩放
-                            (0, 255, 0),               # 颜色 (B, G, R)
-                            2,                         # 线宽
-                            cv2.LINE_AA                # 抗锯齿
+                            str(pts1.shape[0]),
+                            (10, 180),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            1.5,
+                            (0, 255, 0),
+                            2,
+                            cv2.LINE_AA,
                         )
                 else:
                     # 可用点太少
@@ -422,75 +430,76 @@ class TrackEngine:
                 self.of_prev_gray = None
                 self.of_prev_pts = None
 
-        # --------- STEP1: YOLO 检测（每帧都跑） ----------
-        self.target_class_name = target_class
-        self.target_class_id = None
-        for i, name in self.names.items():
-            if name == self.target_class_name:
-                self.target_class_id = int(i)
-                break
-
-        result = self.model.track(
-            frame,
-            persist=True,
-            verbose=False,
-            device=self.device,
-            tracker=self.tracker_cfg,
-            imgsz=960,
-        )[0]
-
         # 写入缩放后的视频帧到临时文件（可视化时用的是 vis_frame，而不是打码后的 frame）
         if self.temp_writer is not None:
             self.temp_writer.write(vis_frame)
 
-        boxes = result.boxes
-        masks = getattr(result, "masks", None)  # YOLOv11-seg 时可能存在
+        # --------- STEP1: YOLO 检测（改成每 det_interval 帧跑一次） ----------
         selected_xywh: List[Tuple[float, float, float, float]] = []
         selected_confs: List[float] = []
         selected_masks: List[Optional[np.ndarray]] = []
-
         mask_union = None
-        if boxes is not None and boxes.xywh is not None and self.target_class_id is not None:
-            xywh = boxes.xywh.cpu().numpy()
-            confs = boxes.conf.cpu().numpy()
-            cls_ids = boxes.cls.int().cpu().numpy()
 
-            # seg mask 数据（如果有）
-            mask_data = None
-            if masks is not None and getattr(masks, "data", None) is not None:
-                mask_data = masks.data.cpu().numpy()  # (N, Hm, Wm)
+        if run_detection:
+            self.target_class_name = target_class
+            self.target_class_id = None
+            for i, name in self.names.items():
+                if name == self.target_class_name:
+                    self.target_class_id = int(i)
+                    break
 
-            for idx, ((cx, cy, w_box, h_box), conf, cls_id) in enumerate(zip(xywh, confs, cls_ids)):
-                if cls_id == self.target_class_id:
-                    selected_xywh.append((float(cx), float(cy), float(w_box), float(h_box)))
-                    selected_confs.append(float(conf))
+            result = self.model.track(
+                frame,
+                persist=True,
+                verbose=False,
+                device=self.device,
+                tracker=self.tracker_cfg,
+                imgsz=960,
+            )[0]
 
-                    if mask_data is not None and idx < mask_data.shape[0]:
-                        m = mask_data[idx]
-                        # 转成 uint8 mask，必要时 resize 到当前帧尺寸
-                        if m.shape != gray.shape:
-                            m_resized = cv2.resize(
-                                m.astype(np.float32),
-                                (w, h),
-                                interpolation=cv2.INTER_NEAREST,
-                            )
-                            m_bin = (m_resized > 0.5).astype(np.uint8)
+            boxes = result.boxes
+            masks = getattr(result, "masks", None)  # YOLOv11-seg 时可能存在
+
+            if boxes is not None and boxes.xywh is not None and self.target_class_id is not None:
+                xywh = boxes.xywh.cpu().numpy()
+                confs = boxes.conf.cpu().numpy()
+                cls_ids = boxes.cls.int().cpu().numpy()
+
+                # seg mask 数据（如果有）
+                mask_data = None
+                if masks is not None and getattr(masks, "data", None) is not None:
+                    mask_data = masks.data.cpu().numpy()  # (N, Hm, Wm)
+
+                for idx, ((cx, cy, w_box, h_box), conf, cls_id) in enumerate(zip(xywh, confs, cls_ids)):
+                    if cls_id == self.target_class_id:
+                        selected_xywh.append((float(cx), float(cy), float(w_box), float(h_box)))
+                        selected_confs.append(float(conf))
+
+                        if mask_data is not None and idx < mask_data.shape[0]:
+                            m = mask_data[idx]
+                            # 转成 uint8 mask，必要时 resize 到当前帧尺寸
+                            if m.shape != gray.shape:
+                                m_resized = cv2.resize(
+                                    m.astype(np.float32),
+                                    (w, h),
+                                    interpolation=cv2.INTER_NEAREST,
+                                )
+                                m_bin = (m_resized > 0.5).astype(np.uint8)
+                            else:
+                                m_bin = (m > 0.5).astype(np.uint8)
+
+                            if mask_union is None:
+                                mask_union = m_bin
+                            else:
+                                mask_union |= m_bin
+
+                            selected_masks.append(m_bin)
                         else:
-                            m_bin = (m > 0.5).astype(np.uint8)
-
-                        if mask_union is None:
-                            mask_union = m_bin
-                        else:
-                            mask_union |= m_bin
-                            
-                        selected_masks.append(m_bin)
-                    else:
-                        selected_masks.append(None)
+                            selected_masks.append(None)
 
         num_obj = len(selected_xywh)
 
-       # --------- STEP2: 绘制锁定 HUD ----------
-
+        # --------- STEP2: 绘制锁定 HUD ----------
         h_img, w_img = vis_frame.shape[:2]
 
         # 统一用锁定绿，避免彩虹色的 debug 感
@@ -498,10 +507,10 @@ class TrackEngine:
 
         # 线宽和长度跟分辨率成比例，保证在 1080p/4K 都好看
         base = min(h_img, w_img)
-        line_thickness = max(2, base // 400)          # e.g. 1080p ≈ 2~3 像素
-        corner_ratio = 0.25                           # 角框占 bbox 边长的 1/4
-        cross_ratio = 0.12                            # 十字长度占 bbox 边长的 1/8 左右
-        circle_ratio = 0.10                           # 中心小圆半径
+        line_thickness = max(2, base // 400)
+        corner_ratio = 0.25
+        cross_ratio = 0.12
+        circle_ratio = 0.10
 
         for idx, (cx, cy, w_box, h_box) in enumerate(selected_xywh):
             # 主目标高亮，其他目标可以考虑画成灰色/细线
@@ -517,52 +526,52 @@ class TrackEngine:
             edge = min(w_i, h_i)
 
             corner_len = max(4, int(corner_ratio * edge))
-            cross_len  = max(3, int(cross_ratio * edge))
-            circle_r   = max(3, int(circle_ratio * edge))
+            cross_len = max(3, int(cross_ratio * edge))
+            circle_r = max(3, int(circle_ratio * edge))
 
             # 四个角（L 型 bracket）
             cv2.line(vis_frame, (x1, y1), (x1 + corner_len, y1),
-                     color, line_thickness, lineType=cv2.LINE_AA)
+                    color, line_thickness, lineType=cv2.LINE_AA)
             cv2.line(vis_frame, (x1, y1), (x1, y1 + corner_len),
-                     color, line_thickness, lineType=cv2.LINE_AA)
+                    color, line_thickness, lineType=cv2.LINE_AA)
 
             cv2.line(vis_frame, (x2, y1), (x2 - corner_len, y1),
-                     color, line_thickness, lineType=cv2.LINE_AA)
+                    color, line_thickness, lineType=cv2.LINE_AA)
             cv2.line(vis_frame, (x2, y1), (x2, y1 + corner_len),
-                     color, line_thickness, lineType=cv2.LINE_AA)
+                    color, line_thickness, lineType=cv2.LINE_AA)
 
             cv2.line(vis_frame, (x1, y2), (x1 + corner_len, y2),
-                     color, line_thickness, lineType=cv2.LINE_AA)
+                    color, line_thickness, lineType=cv2.LINE_AA)
             cv2.line(vis_frame, (x1, y2), (x1, y2 - corner_len),
-                     color, line_thickness, lineType=cv2.LINE_AA)
+                    color, line_thickness, lineType=cv2.LINE_AA)
 
             cv2.line(vis_frame, (x2, y2), (x2 - corner_len, y2),
-                     color, line_thickness, lineType=cv2.LINE_AA)
+                    color, line_thickness, lineType=cv2.LINE_AA)
             cv2.line(vis_frame, (x2, y2), (x2, y2 - corner_len),
-                     color, line_thickness, lineType=cv2.LINE_AA)
+                    color, line_thickness, lineType=cv2.LINE_AA)
 
             # 中心十字 + 小圆（更像瞄准器）
             cx_i = int(cx)
             cy_i = int(cy)
 
             cv2.line(vis_frame,
-                     (cx_i - cross_len, cy_i),
-                     (cx_i + cross_len, cy_i),
-                     color, line_thickness, lineType=cv2.LINE_AA)
+                    (cx_i - cross_len, cy_i),
+                    (cx_i + cross_len, cy_i),
+                    color, line_thickness, lineType=cv2.LINE_AA)
             cv2.line(vis_frame,
-                     (cx_i, cy_i - cross_len),
-                     (cx_i, cy_i + cross_len),
-                     color, line_thickness, lineType=cv2.LINE_AA)
+                    (cx_i, cy_i - cross_len),
+                    (cx_i, cy_i + cross_len),
+                    color, line_thickness, lineType=cv2.LINE_AA)
 
             cv2.circle(vis_frame,
-                       (cx_i, cy_i),
-                       circle_r,
-                       color,
-                       thickness=1,
-                       lineType=cv2.LINE_AA)
+                    (cx_i, cy_i),
+                    circle_r,
+                    color,
+                    thickness=1,
+                    lineType=cv2.LINE_AA)
 
-        # --------- STEP3: 根据检测情况重置光流参考帧（只在 num_obj == 1 时） ----------
-        if num_obj == 1:
+        # --------- STEP3: 根据检测情况重置光流参考帧（只在检测帧且 num_obj == 1 时） ----------
+        if run_detection and num_obj == 1:
             cx, cy, w_box, h_box = selected_xywh[0]
 
             # 选一个 mask：优先用语义 mask，退化到 bbox
@@ -594,7 +603,7 @@ class TrackEngine:
                 self.of_tracking = False
 
         # Then show mask
-        if self.debug_mode:        
+        if self.debug_mode:
             if mask_union is not None and mask_union.any():
                 overlay = vis_frame.astype(np.float32)
                 # 给 mask 区域上色：偏绿色
@@ -617,7 +626,7 @@ class TrackEngine:
         else:
             timestamp = 0.0
 
-        if num_obj == 1:
+        if run_detection and num_obj == 1:
             cx, cy, w_box, h_box = selected_xywh[0]
             conf = selected_confs[0]
             track_frame = TrackFrame(
@@ -635,6 +644,7 @@ class TrackEngine:
                 has_delta=bool(has_delta),
             )
         else:
+            # 非检测帧或者检测无目标：没有 bbox，只提供 odom
             track_frame = TrackFrame(
                 timestamp=timestamp,
                 frame_idx=self.current_frame_idx,
@@ -652,6 +662,7 @@ class TrackEngine:
 
         self.track_results.append(track_frame)
         return vis_frame, track_frame
+
 
     def reset_optical_flow_state(self) -> None:
         """Reset optical flow tracking and related state."""
@@ -1166,21 +1177,30 @@ def planning_crop_traj(
     img_width: int,
     img_height: int,
     max_crop_ratio: float,
-    smooth_factor: float = 0.5,  # 保留参数占位
+    smooth_factor: float = 0.5,  # 预留参数，可调平滑/约束权重
     debug: bool = False,
 ) -> List[CropFrame]:
     """
-    简化版裁切规划（delta 积分版）.
+    规划裁切轨迹（odom + 弱 BBOX 全局约束的一次优化版）.
 
-    逻辑：
-    1) 默认所有帧的裁切中心 = 图像正中间。
-    2) 对于 has_delta 连续的段落：
-       - 以该段的第一帧为基准帧：
-         center[s] = 基准帧的检测中心（若无则用图像中心）
-         后续帧中心 = 前一帧中心 + delta（逐帧累加）
-    3) 不在任何 delta 连续段内的帧，一律保持图像中心。
-    4) 裁切宽高由 max_crop_ratio 决定（不再做全局优化）。
+    模型（对 x/y 各做一次一维优化）:
+      - 变量：每一帧的裁切中心 x_i / y_i
+      - 里程计约束（odom，高权重）:
+          对于 has_delta[i] = True:
+              r_odom_x = (x_i - x_{i-1}) - dx[i]
+              r_odom_y = (y_i - y_{i-1}) - dy[i]
+      - 全局 BBOX 约束（弱，全局约束权重很小）:
+          对于 valid_det[i] = True:
+              r_det_x = x_i - cx_det[i]
+              r_det_y = y_i - cy_det[i]
+      - 轻微的“居中”先验（避免完全没检测的帧漂移）:
+          r_center_x = x_i - W/2
+          r_center_y = y_i - H/2
+      - 第 0 帧有一个较强的 anchor，把整体 gauge 固定住。
+
+    最终是一个三对角稀疏系统，对 x, y 各解一次。
     """
+
     if not track_result:
         return []
 
@@ -1197,52 +1217,104 @@ def planning_crop_traj(
     dy_arr = np.array([f.dy for f in track_result], dtype=float)
     has_delta_arr = np.array([f.has_delta for f in track_result], dtype=bool)
 
-    # 1) 默认所有帧中心 = 图像中心
-    center_x = np.full(n, W / 2.0, dtype=float)
-    center_y = np.full(n, H / 2.0, dtype=float)
+    # =========================
+    # 1. 构建/求解一维优化
+    # =========================
 
-    # 2) 找连续 has_delta 段落，做积分
-    # 注意：has_delta[i] 表示 i 与 i-1 之间有 delta
-    i = 1
-    while i < n:
-        # 段落开始条件：当前帧有 delta，且前一帧没有（或 i == 1）
-        if not has_delta_arr[i] or (i > 1 and has_delta_arr[i - 1]):
-            i += 1
-            continue
+    # 权重可以根据经验再调：
+    odom_w = 5.0                     # 里程计约束权重（主导平滑）
+    det_w = 0.001                     # BBOX 全局约束权重（很小，很弱）
+    center_w = 0.00001                 # 轻微“居中”先验
+    anchor_w = 5.0                   # 第 0 帧 anchor，固定整体偏移
 
-        base = i - 1  # 段落的第一帧（无 delta，作为 ref）
-        # 基准中心：优先用该帧的检测中心
-        if valid_det[base]:
-            ref_cx = cx_det[base]
-            ref_cy = cy_det[base]
+    def solve_1d(
+        det_vals: np.ndarray,
+        valid_mask: np.ndarray,
+        delta: np.ndarray,
+        img_center: float,
+    ) -> np.ndarray:
+        """对一维轨迹做 odom + 弱 det + 居中先验的最小二乘优化."""
+        from scipy.sparse import diags
+        from scipy.sparse.linalg import spsolve
+
+        # 三对角：下对角(n-1), 主对角(n), 上对角(n-1)
+        diag = np.zeros(n, dtype=float)
+        lower = np.zeros(n - 1, dtype=float)
+        upper = np.zeros(n - 1, dtype=float)
+        rhs = np.zeros(n, dtype=float)
+
+        # --- 1) 里程计约束 ---
+        # 对 has_delta[i] == True，构造 (x_i - x_{i-1} - delta[i])^2
+        for i in range(1, n):
+            if not has_delta_arr[i]:
+                continue
+            d = delta[i]
+            if not np.isfinite(d):
+                continue
+            w = odom_w
+            # A_row = [ ... -1 (i-1), +1 (i) ... ], 观测值 = d
+            # Normal: A^T W A & A^T W b
+            diag[i - 1] += w
+            diag[i] += w
+            lower[i - 1] += -w
+            upper[i - 1] += -w
+            rhs[i - 1] += -w * d
+            rhs[i] += w * d
+
+        # --- 2) BBOX 全局约束（弱） ---
+        for i in range(n):
+            if not valid_mask[i]:
+                continue
+            v = det_vals[i]
+            if not np.isfinite(v):
+                continue
+            w = det_w
+            # 残差: (x_i - v)^2
+            diag[i] += w
+            rhs[i] += w * v
+
+        # --- 3) 轻微居中先验（所有帧都被轻轻拉向画面中心） ---
+        for i in range(n):
+            w = center_w
+            diag[i] += w
+            rhs[i] += w * img_center
+
+        # --- 4) 第 0 帧强 anchor，固定 gauge ---
+        # 这里不一定用 det，优先 det，其次用图像中心
+        if valid_mask[0] and np.isfinite(det_vals[0]):
+            a_val = det_vals[0]
         else:
-            ref_cx = W / 2.0
-            ref_cy = H / 2.0
+            a_val = img_center
+        diag[0] += anchor_w
+        rhs[0] += anchor_w * a_val
 
-        center_x[base] = ref_cx
-        center_y[base] = ref_cy
+        # 构建稀疏三对角矩阵并求解
+        A = diags(
+            diagonals=[lower, diag, upper],
+            offsets=[-1, 0, 1],
+            format="csc",
+        )
 
-        j = i
-        prev_cx = ref_cx
-        prev_cy = ref_cy
+        x_opt = spsolve(A, rhs)
+        return np.asarray(x_opt, dtype=float)
 
-        while j < n and has_delta_arr[j]:
-            dx = dx_arr[j]
-            dy = dy_arr[j]
-            if not np.isfinite(dx) or not np.isfinite(dy):
-                break
-            prev_cx = prev_cx + dx
-            prev_cy = prev_cy + dy
-            center_x[j] = prev_cx
-            center_y[j] = prev_cy
-            j += 1
+    # 分别优化 x / y
+    center_x = solve_1d(
+        det_vals=cx_det,
+        valid_mask=valid_det,
+        delta=dx_arr,
+        img_center=W / 2.0,
+    )
+    center_y = solve_1d(
+        det_vals=cy_det,
+        valid_mask=valid_det,
+        delta=dy_arr,
+        img_center=H / 2.0,
+    )
 
-        # 你如果希望“短段落”直接丢弃，可以在这里判断段长 j-base
-        # 目前不做最小长度限制，完全按 delta 连续性来。
-
-        i = j + 1
-
-    # 3) 根据 max_crop_ratio 决定裁切宽高（简单映射）
+    # =========================
+    # 2. 根据 max_crop_ratio 决定裁切宽高
+    # =========================
     crop_ratio = float(np.clip(max_crop_ratio, 0.0, 0.9))
     crop_width = W * (1.0 - crop_ratio)
     crop_height = H * (1.0 - crop_ratio)
@@ -1258,30 +1330,55 @@ def planning_crop_traj(
                 crop_width=float(crop_width),
                 crop_height=float(crop_height),
                 scale=1.0,
-                clamp=False,   # 不再做 clamp，黑边交给导出函数处理
+                clamp=False,  # 仍然不在规划阶段做 clamp，黑边交给导出函数处理
             )
         )
 
-    # debug 可视化简单画一下 center_x/center_y
+    # =========================
+    # 3. Debug 可视化
+    # =========================
     if debug:
         try:
             import matplotlib.pyplot as plt
+
             t = timestamps
-            plt.figure(figsize=(10, 4))
+
+            plt.figure(figsize=(10, 6))
             plt.subplot(2, 1, 1)
-            plt.title("Center X with delta integration")
-            plt.plot(t, center_x, "r-")
-            plt.axhline(W / 2.0, color="gray", linestyle="--")
+            plt.title("Crop Center X: optimized vs detections")
+            plt.plot(t, center_x, "-", label="optimized_x")
+            plt.axhline(W / 2.0, linestyle="--", label="image_center")
+            if np.any(valid_det):
+                plt.scatter(
+                    t[valid_det],
+                    cx_det[valid_det],
+                    s=10,
+                    marker="x",
+                    label="bbox_cx",
+                )
+            plt.legend()
+
             plt.subplot(2, 1, 2)
-            plt.title("Center Y with delta integration")
-            plt.plot(t, center_y, "b-")
-            plt.axhline(H / 2.0, color="gray", linestyle="--")
+            plt.title("Crop Center Y: optimized vs detections")
+            plt.plot(t, center_y, "-", label="optimized_y")
+            plt.axhline(H / 2.0, linestyle="--", label="image_center")
+            if np.any(valid_det):
+                plt.scatter(
+                    t[valid_det],
+                    cy_det[valid_det],
+                    s=10,
+                    marker="x",
+                    label="bbox_cy",
+                )
+            plt.legend()
+
             plt.tight_layout()
             plt.show()
         except Exception as e:
-            print(f"[planning debug] matplotlib not available: {e}")
+            print(f"[planning debug] matplotlib not available or failed: {e}")
 
     return crop_frames
+
 
 
 # ======================================================================
