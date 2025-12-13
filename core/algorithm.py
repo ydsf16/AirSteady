@@ -26,6 +26,71 @@ def resource_path(relative_path: str) -> str:
         base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 
+# ---------------------------
+# 1) Sony S-Log3 -> Scene Linear (reflection)
+#    Source: Sony "Technical Summary for S-Gamut3.Cine/S-Log3..." Appendix
+# ---------------------------
+def slog3_to_linear(x_norm: np.ndarray) -> np.ndarray:
+    """
+    x_norm: normalized code value in [0,1] (full range), per channel.
+    return: scene-linear reflection (can exceed 1.0 in highlights).
+    """
+    x = x_norm.astype(np.float32)
+    t = 171.2102946929 / 1023.0
+
+    hi = (10.0 ** ((x * 1023.0 - 420.0) / 261.5)) * (0.18 + 0.01) - 0.01
+    lo = (x * 1023.0 - 95.0) * 0.01125 / (171.2102946929 - 95.0)
+
+    y = np.where(x >= t, hi, lo)
+    return y
+
+# ---------------------------
+# 2) Linear -> Rec.709 OETF (display gamma)
+# ---------------------------
+def linear_to_rec709_oetf(lin: np.ndarray) -> np.ndarray:
+    """
+    lin: scene-linear (>=0). We'll clamp negative.
+    return: Rec709 display-encoded in [0,1] (before quantization).
+    """
+    L = np.maximum(lin, 0.0).astype(np.float32)
+    # Rec.709 OETF
+    a = 0.018
+    V = np.where(L < a, 4.5 * L, 1.099 * (L ** 0.45) - 0.099)
+    return V
+
+# ---------------------------
+# 3) Build LUT for uint8 (fast)
+# ---------------------------
+def build_slog3_to_rec709_lut_u8() -> np.ndarray:
+    """
+    Returns LUT of shape (256,), mapping uint8 code -> uint8 rec709.
+    Assumes full-range mapping 0..255 -> 0..1.
+    """
+    x = np.arange(256, dtype=np.float32) / 255.0
+    lin = slog3_to_linear(x)
+    # Optional highlight compression for YOLO friendliness (avoid clipping):
+    # You can try one of these:
+    # lin = lin / (1.0 + lin)           # Reinhard tone-map
+    # lin = np.minimum(lin, 1.0)        # hard clip
+    lin = lin / (1.0 + lin)            # recommended default for harsh highlights
+
+    v = linear_to_rec709_oetf(lin)
+    v = np.clip(v, 0.0, 1.0)
+    lut = np.round(v * 255.0).astype(np.uint8)
+    return lut
+
+_SLOG3_TO_709_LUT_U8 = build_slog3_to_rec709_lut_u8()
+
+def slog3_bgr_u8_to_rec709_bgr_u8(bgr_u8: np.ndarray) -> np.ndarray:
+    """
+    OpenCV BGR uint8 in, BGR uint8 out.
+    """
+    # Apply per-channel LUT (fast)
+    b, g, r = cv2.split(bgr_u8)
+    b2 = cv2.LUT(b, _SLOG3_TO_709_LUT_U8)
+    g2 = cv2.LUT(g, _SLOG3_TO_709_LUT_U8)
+    r2 = cv2.LUT(r, _SLOG3_TO_709_LUT_U8)
+    return cv2.merge([b2, g2, r2])
 
 # ======================================================================
 # 跟踪部分
@@ -58,7 +123,7 @@ class TrackEngine:
     - 负责打开原始视频
     - 限制尺寸到工作分辨率 (scale_width, scale_height)
     - 调用 YOLO 跟踪飞机，返回 TrackFrame 和可视化图像
-    - 同时把工作分辨率视频写入临时文件 tmp_track.mp4，供后续稳像规划使用
+    - 同时把工作分辨率视频写入临时文件 tmp_track.avi，供后续稳像规划使用
     """
 
     def __init__(
@@ -99,8 +164,8 @@ class TrackEngine:
         self.names = self.model.names  # dict: {0: 'person', 1: 'bicycle', ...}
 
         # 预览时限制最大尺寸
-        self.max_width  = 4000
-        self.max_height = 4000
+        self.max_width  = 2160
+        self.max_height = 2160
 
         # 跟踪结果（完整轨迹）
         self.track_results: List[TrackFrame] = []
@@ -112,11 +177,11 @@ class TrackEngine:
         print("Model loaded")
 
         # 预览视频（缩放后）临时路径
-        self.tmp_video_path = os.path.join(get_airsteady_cache_dir(), "tmp_track.mp4")
-        self.tmp_video_show_path = os.path.join(get_airsteady_cache_dir(), "tmp_track_show.mp4")
+        self.tmp_video_path = os.path.join(get_airsteady_cache_dir(), "tmp_track.avi")
+        self.tmp_video_show_path = os.path.join(get_airsteady_cache_dir(), "tmp_track_show.avi")
         self.temp_writer: Optional[cv2.VideoWriter] = None
         self.temp_writer_show: Optional[cv2.VideoWriter] = None
-        self.fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self.fourcc = cv2.VideoWriter_fourcc(*"MJPG")
 
         # 当前选择的类别
         self.target_class_name: str = "airplane"
@@ -129,13 +194,13 @@ class TrackEngine:
 
         # 光流 RANSAC 参数（纯平移模型）
         self.of_min_track_points: int = 20
-        self.of_ransac_threshold: float = 5.0
+        self.of_ransac_threshold: float = 15.0
         self.of_ransac_max_iters: int = 300
         self.of_min_inlier_ratio: float = 0.00000001
 
-        self.debug_mode = False
+        self.debug_mode = True
 
-        self.det_interval = 2
+        self.det_interval = 5
     
     
     def estimate_translation_ransac(
@@ -268,6 +333,25 @@ class TrackEngine:
 
         self.reset_optical_flow_state()
 
+    def enhance_for_analysis(self, bgr: np.ndarray) -> np.ndarray:
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l2 = clahe.apply(l)
+
+        lab2 = cv2.merge([l2, a, b])
+        out = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+
+        # gamma
+        gamma = 1.2
+        lut = (np.power(np.arange(256) / 255.0, 1.0 / gamma) * 255.0).astype(np.uint8)
+        out = cv2.LUT(out, lut)
+
+        # optional denoise (very light)
+        # out = cv2.bilateralFilter(out, d=5, sigmaColor=30, sigmaSpace=30)
+
+        return out
     # ------------------------------------------------------------------
     # 单步前向：读取下一帧，做 YOLO + 跟踪
     # ------------------------------------------------------------------
@@ -285,6 +369,7 @@ class TrackEngine:
         success, frame = self.cap.read()
         if not success or frame is None:
             return None, None
+        
 
         # 缩放到工作分辨率
         if self.scale_ratio != 1.0:
@@ -293,6 +378,8 @@ class TrackEngine:
                 (self.scale_width, self.scale_height),
                 interpolation=cv2.INTER_AREA,
             )
+        
+        # frame = slog3_bgr_u8_to_rec709_bgr_u8(frame)
 
         vis_frame = frame.copy()
         h, w = frame.shape[:2]
@@ -1465,200 +1552,457 @@ def _map_crop_to_full_res(
 
     return x1, y1, x2, y2
 
+import os
+from fractions import Fraction
+from typing import Callable, List, Optional, Tuple, Union
+
+import av
+import numpy as np
+from av.audio.resampler import AudioResampler
+
+BorderValue = Union[int, Tuple[int, int, int]]
+
+
+def _has_encoder(name: str) -> bool:
+    try:
+        av.codec.Codec(name, "w")
+        return True
+    except Exception:
+        return False
+
+
+def _encoder_from_codec_name(codec_name: str) -> str:
+    name = (codec_name or "").lower()
+    if name in ("h264", "avc1"):
+        return "libx264"
+    if name in ("hevc", "h265"):
+        return "libx265"
+    if name == "vp9":
+        return "libvpx-vp9"
+    if name == "av1":
+        return "libaom-av1"
+    return "libx264"
+
+def _warp_translate_int_fast(
+    img: np.ndarray,
+    dx: float,
+    dy: float,
+    out_w: int,
+    out_h: int,
+) -> np.ndarray:
+    """
+    Fast integer-translate warp (nearest / no interpolation).
+    Equivalent to warpAffine with dx,dy rounded to int, BORDER_CONSTANT black.
+    """
+    H, W, C = img.shape
+    assert C == 3
+
+    ix = int(round(dx))
+    iy = int(round(dy))
+
+    # output pixel u maps to source u - dx  -> source window starts at -dx
+    src_x0 = -ix
+    src_y0 = -iy
+    src_x1 = src_x0 + out_w
+    src_y1 = src_y0 + out_h
+
+    out = np.zeros((out_h, out_w, 3), dtype=img.dtype)
+
+    sx0 = max(0, src_x0)
+    sy0 = max(0, src_y0)
+    sx1 = min(W, src_x1)
+    sy1 = min(H, src_y1)
+
+    if sx1 <= sx0 or sy1 <= sy0:
+        return out
+
+    dx0 = sx0 - src_x0
+    dy0 = sy0 - src_y0
+    dx1 = dx0 + (sx1 - sx0)
+    dy1 = dy0 + (sy1 - sy0)
+
+    out[dy0:dy1, dx0:dx1] = img[sy0:sy1, sx0:sx1]
+    return out
+
+def _warp_translate_bilinear(
+    img: np.ndarray,
+    dx: float,
+    dy: float,
+    out_w: int,
+    out_h: int,
+    border_value: BorderValue = (0, 0, 0),
+) -> np.ndarray:
+    """
+    Equivalent to:
+      cv2.warpAffine(img, [[1,0,dx],[0,1,dy]], (out_w,out_h),
+                    flags=INTER_LINEAR, borderMode=BORDER_CONSTANT, borderValue=border_value)
+
+    img: HxWx3 uint8 (bgr24)
+    """
+    if img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError(f"_warp_translate_bilinear expects HxWx3, got {img.shape}")
+    H, W, _ = img.shape
+    if out_w <= 0 or out_h <= 0:
+        raise ValueError(f"invalid output size: {out_w}x{out_h}")
+
+    u = np.arange(out_w, dtype=np.float32)
+    v = np.arange(out_h, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v)
+
+    # dst(u,v) = src(u - dx, v - dy)
+    x = uu - np.float32(dx)
+    y = vv - np.float32(dy)
+
+    x0 = np.floor(x).astype(np.int32)
+    y0 = np.floor(y).astype(np.int32)
+    x1 = x0 + 1
+    y1 = y0 + 1
+
+    wx = x - x0.astype(np.float32)
+    wy = y - y0.astype(np.float32)
+
+    def in_bounds(xx, yy):
+        return (xx >= 0) & (xx < W) & (yy >= 0) & (yy < H)
+
+    m00 = in_bounds(x0, y0)
+    m10 = in_bounds(x1, y0)
+    m01 = in_bounds(x0, y1)
+    m11 = in_bounds(x1, y1)
+
+    out = np.zeros((out_h, out_w, 3), dtype=np.float32)
+
+    def gather(xx, yy, mask):
+        xx_clip = np.clip(xx, 0, W - 1)
+        yy_clip = np.clip(yy, 0, H - 1)
+        val = img[yy_clip, xx_clip].astype(np.float32)
+        val *= mask[..., None].astype(np.float32)
+        return val
+
+    I00 = gather(x0, y0, m00)
+    I10 = gather(x1, y0, m10)
+    I01 = gather(x0, y1, m01)
+    I11 = gather(x1, y1, m11)
+
+    w00 = (1.0 - wx) * (1.0 - wy)
+    w10 = wx * (1.0 - wy)
+    w01 = (1.0 - wx) * wy
+    w11 = wx * wy
+
+    out += I00 * w00[..., None]
+    out += I10 * w10[..., None]
+    out += I01 * w01[..., None]
+    out += I11 * w11[..., None]
+
+    any_in = m00 | m10 | m01 | m11
+    if isinstance(border_value, tuple):
+        bv = np.array(border_value, dtype=np.float32).reshape(1, 1, 3)
+        out[~any_in] = bv
+    else:
+        out[~any_in] = float(border_value)
+
+    return np.clip(out, 0, 255).astype(np.uint8)
+
 
 def export_stabilized_video(
     input_video_path: str,
-    crop_frames: List[CropFrame],
+    crop_frames: List["CropFrame"],
     output_video_path: str,
     work_width: int,
     work_height: int,
     progress_cb: Optional[Callable[[float], None]] = None,
-    add_brand_watermark: bool = False,  # ⭐ 新增：是否打“AirSteady”水印
+    add_brand_watermark: bool = False,  # 保留参数以兼容旧接口（本实现不做水印）
 ) -> None:
     """
-    根据 crop_frames 对输入视频进行逐帧裁切，生成稳定后的视频。
-    增强版：增加了一堆防御性检查，避免 OpenCV 抛出“Unknown C++ exception”。
-
-    Args:
-        ...
-        add_brand_watermark: 若为 True，则在每一帧右下角打上
-            “稳定处理 · AirSteady「航迹稳拍」” 水印。
+    Drop-in exporter:
+      - PyAV decode + encode
+      - Per-frame translation warp (linear + constant border black)
+      - Audio: try stream copy; fallback to AAC (with resample); if AAC not available -> no audio
+      - FPS uses rational rate
+      - IMPORTANT FIX: DO NOT trust in_video.frames for clamping (can be wrong)
+      - Bitrate: if input has bitrate, try to keep similar bitrate for output
     """
     if not crop_frames:
         raise RuntimeError("export_stabilized_video: crop_frames is empty")
-
-    cap = cv2.VideoCapture(input_video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"export_stabilized_video: failed to open input video: {input_video_path}")
-
-    frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames_cap = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    if frame_w <= 0 or frame_h <= 0:
-        cap.release()
-        raise RuntimeError(
-            f"export_stabilized_video: input video has invalid size "
-            f"{frame_w}x{frame_h} (path={input_video_path})"
-        )
-
-    if fps <= 1e-3 or not np.isfinite(fps):
-        fps = 30.0
-
-    # 只导出两者中的最小值，防止 plan 比实际帧数多
-    total_frames = min(len(crop_frames), total_frames_cap if total_frames_cap > 0 else len(crop_frames))
-    if total_frames == 0:
-        cap.release()
-        raise RuntimeError("export_stabilized_video: no frames to export (total_frames == 0)")
-
-    # 估算输出分辨率（基于第一帧裁切宽高）
-    sx = frame_w / float(work_width) if work_width > 0 else 1.0
-    sy = frame_h / float(work_height) if work_height > 0 else 1.0
-
-    first_cf = crop_frames[0]
-    out_w = int(round(first_cf.crop_width * sx))
-    out_h = int(round(first_cf.crop_height * sy))
-
-    out_w = min(out_w, frame_w)
-    out_h = min(out_h, frame_h)
-
-    # 偶数尺寸 + 正数检查
-    if out_w % 2 == 1:
-        out_w -= 1
-    if out_h % 2 == 1:
-        out_h -= 1
-
-    if out_w <= 0 or out_h <= 0 or not np.isfinite(out_w) or not np.isfinite(out_h):
-        cap.release()
-        raise RuntimeError(
-            f"export_stabilized_video: invalid output size "
-            f"{out_w}x{out_h}, frame={frame_w}x{frame_h}, "
-            f"work=({work_width}x{work_height}), "
-            f"first_crop=({first_cf.crop_width}x{first_cf.crop_height})"
-        )
+    if work_width <= 0 or work_height <= 0:
+        raise RuntimeError(f"export_stabilized_video: invalid work size {work_width}x{work_height}")
 
     os.makedirs(os.path.dirname(output_video_path) or ".", exist_ok=True)
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_video_path, fourcc, fps, (out_w, out_h))
-    if not writer.isOpened():
-        cap.release()
-        raise RuntimeError(f"export_stabilized_video: failed to open VideoWriter: {output_video_path}")
+    in_container = None
+    out_container = None
 
-    # ⭐ 水印文字基础配置（后面按分辨率自适应缩放）
-    brand_text = "Stabilized by AirSteady"
-    font = cv2.FONT_HERSHEY_DUPLEX  # 比 SIMPLEX 好看一点
-    base_font_scale = 0.7          # 针对 1080p 设计的基准字号
-    thickness = 1
-
-    # 这里用 out_w/out_h 来预估位置，真正绘制时会拿当前帧尺寸再安全 clamp 一下
-    # text_size, baseline = cv2.getTextSize(brand_text, font, font_scale, thickness)
-    # text_w, text_h = text_size
-
-    frame_idx = 0
     try:
-        while frame_idx < total_frames:
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                # 提前结束，也算正常退出
+        in_container = av.open(input_video_path)
+
+        in_video = next((s for s in in_container.streams if s.type == "video"), None)
+        if in_video is None:
+            raise RuntimeError(f"export_stabilized_video: no video stream: {input_video_path}")
+
+        in_audio = next((s for s in in_container.streams if s.type == "audio"), None)
+
+        src_w = int(in_video.codec_context.width or 0)
+        src_h = int(in_video.codec_context.height or 0)
+        if src_w <= 0 or src_h <= 0:
+            raise RuntimeError(
+                f"export_stabilized_video: input video has invalid size {src_w}x{src_h} (path={input_video_path})"
+            )
+
+        # FPS as Fraction/Rational (PyAV prefers this)
+        fps_rate = in_video.average_rate
+        if fps_rate is None:
+            fps_rate = Fraction(30, 1)
+        try:
+            fps_float = float(fps_rate)
+        except Exception:
+            fps_rate = Fraction(30, 1)
+            fps_float = 30.0
+        if (not np.isfinite(fps_float)) or fps_float <= 1e-3:
+            fps_rate = Fraction(30, 1)
+            fps_float = 30.0
+
+        # ✅ FIX: trust plan length, NOT in_video.frames
+        total_frames = len(crop_frames)
+        if total_frames <= 0:
+            raise RuntimeError("export_stabilized_video: no frames to export (total_frames == 0)")
+
+        # Work->full scaling
+        sx = src_w / float(work_width)
+        sy = src_h / float(work_height)
+
+        # Output size from first crop frame (same semantics as your original)
+        first_cf = crop_frames[0]
+        out_w = int(round(float(first_cf.crop_width) * sx))
+        out_h = int(round(float(first_cf.crop_height) * sy))
+        out_w = min(out_w, src_w)
+        out_h = min(out_h, src_h)
+
+        # Even sizes
+        if out_w % 2 == 1:
+            out_w -= 1
+        if out_h % 2 == 1:
+            out_h -= 1
+        if out_w <= 0 or out_h <= 0:
+            raise RuntimeError(f"export_stabilized_video: invalid output size {out_w}x{out_h}")
+
+        out_container = av.open(output_video_path, mode="w")
+
+        # --- Video stream (best-effort keep codec family) ---
+        in_codec_name = (in_video.codec_context.name or in_video.codec.name or "").lower()
+        encoder_name = _encoder_from_codec_name(in_codec_name)
+        if not _has_encoder(encoder_name):
+            encoder_name = "libx264"
+
+        try:
+            out_v = out_container.add_stream(encoder_name, rate=fps_rate)
+        except Exception:
+            out_v = out_container.add_stream("libx264", rate=fps_rate)
+
+        out_v.width = out_w
+        out_v.height = out_h
+        out_v.pix_fmt = "yuv420p"
+
+        # ✅ Bitrate policy: if input has bitrate, try to keep it similar (closer file size)
+        in_br = int(getattr(in_video.codec_context, "bit_rate", 0) or 0)
+        if in_br > 0:
+            try:
+                out_v.bit_rate = in_br
+                # keep preset only; avoid CRF overriding ABR intent
+                out_v.options = {"preset": "medium"}
+            except Exception:
+                # fallback to CRF
+                out_v.options = {"crf": "18", "preset": "medium"}
+        else:
+            out_v.options = {"crf": "18", "preset": "medium"}
+
+        # --- Audio stream: copy -> AAC fallback(with resample) -> no audio ---
+        out_a = None
+        audio_copy = False
+        audio_resampler: Optional[AudioResampler] = None
+
+        if in_audio is not None:
+            # Try stream copy
+            try:
+                out_a = out_container.add_stream(template=in_audio)
+                audio_copy = True
+            except Exception:
+                out_a = None
+                audio_copy = False
+
+            # AAC fallback (stable)
+            if out_a is None:
+                if _has_encoder("aac"):
+                    out_a = out_container.add_stream("aac", rate=48000)
+                    out_a.bit_rate = 192_000
+                    try:
+                        out_a.layout = "stereo"
+                    except Exception:
+                        pass
+                    audio_resampler = AudioResampler(format="fltp", layout="stereo", rate=48000)
+                else:
+                    out_a = None  # no audio
+
+        export_duration_sec = float(total_frames) / float(fps_float)
+
+        dst_cx = out_w / 2.0
+        dst_cy = out_h / 2.0
+
+        frame_idx = 0
+        video_done = False
+        audio_done = (in_audio is None or out_a is None)
+
+        streams = [in_video]
+        if in_audio is not None:
+            streams.append(in_audio)
+
+        for packet in in_container.demux(streams):
+            stype = packet.stream.type
+
+            # ---- Audio ----
+            if stype == "audio" and (not audio_done) and (out_a is not None):
+                if packet.pts is not None and packet.time_base is not None:
+                    if float(packet.pts * packet.time_base) >= export_duration_sec:
+                        audio_done = True
+                        continue
+
+                if audio_copy:
+                    try:
+                        packet.stream = out_a
+                        out_container.mux(packet)
+                    except Exception:
+                        # Switch to AAC re-encode if copy fails
+                        audio_copy = False
+
+                        if out_a.codec.name != "aac":
+                            if _has_encoder("aac"):
+                                out_a = out_container.add_stream("aac", rate=48000)
+                                out_a.bit_rate = 192_000
+                                try:
+                                    out_a.layout = "stereo"
+                                except Exception:
+                                    pass
+                                audio_resampler = AudioResampler(format="fltp", layout="stereo", rate=48000)
+                            else:
+                                out_a = None
+                                audio_done = True
+                                continue
+
+                        for aframe in packet.decode():
+                            if aframe.pts is not None and aframe.time_base is not None:
+                                if float(aframe.pts * aframe.time_base) >= export_duration_sec:
+                                    audio_done = True
+                                    break
+
+                            if audio_resampler is not None:
+                                res = audio_resampler.resample(aframe)
+                                if res is None:
+                                    continue
+                                if not isinstance(res, list):
+                                    res = [res]
+                                for rf in res:
+                                    for opkt in out_a.encode(rf):
+                                        out_container.mux(opkt)
+                            else:
+                                for opkt in out_a.encode(aframe):
+                                    out_container.mux(opkt)
+                else:
+                    if out_a is None:
+                        audio_done = True
+                        continue
+                    for aframe in packet.decode():
+                        if aframe.pts is not None and aframe.time_base is not None:
+                            if float(aframe.pts * aframe.time_base) >= export_duration_sec:
+                                audio_done = True
+                                break
+
+                        if audio_resampler is not None:
+                            res = audio_resampler.resample(aframe)
+                            if res is None:
+                                continue
+                            if not isinstance(res, list):
+                                res = [res]
+                            for rf in res:
+                                for opkt in out_a.encode(rf):
+                                    out_container.mux(opkt)
+                        else:
+                            for opkt in out_a.encode(aframe):
+                                out_container.mux(opkt)
+
+                if video_done and audio_done:
+                    break
+                continue
+
+            # ---- Video ----
+            if stype != "video":
+                continue
+
+            if video_done:
+                if audio_done:
+                    break
+                continue
+
+            for frame in packet.decode():
+                if frame_idx >= total_frames:
+                    video_done = True
+                    break
+
+                img = frame.to_ndarray(format="bgr24")
+
+                cf = crop_frames[frame_idx]
+                cx_full = float(cf.crop_center_x) * sx
+                cy_full = float(cf.crop_center_y) * sy
+                if not (np.isfinite(cx_full) and np.isfinite(cy_full)):
+                    cx_full = src_w / 2.0
+                    cy_full = src_h / 2.0
+
+                dx = dst_cx - cx_full
+                dy = dst_cy - cy_full
+
+                out_img = _warp_translate_int_fast( #TBD
+                    img=img,
+                    dx=dx,
+                    dy=dy,
+                    out_w=out_w,
+                    out_h=out_h,
+                    #border_value=(0, 0, 0),
+                )
+
+                out_frame = av.VideoFrame.from_ndarray(out_img, format="bgr24")
+                out_frame.pts = frame_idx  # CFR
+
+                for opkt in out_v.encode(out_frame):
+                    out_container.mux(opkt)
+
+                frame_idx += 1
+                if progress_cb is not None:
+                    progress_cb(100.0 * frame_idx / float(max(1, total_frames)))
+
+            if video_done and audio_done:
                 break
 
-            cf = crop_frames[frame_idx]
+        # Flush encoders
+        for opkt in out_v.encode():
+            out_container.mux(opkt)
 
-            # ========== 新版：根据中心做平移 + 黑边 ==========
-            # work 坐标 -> 原图坐标
-            sx = frame_w / float(work_width) if work_width > 0 else 1.0
-            sy = frame_h / float(work_height) if work_height > 0 else 1.0
+        if out_a is not None and (not audio_copy):
+            for opkt in out_a.encode():
+                out_container.mux(opkt)
 
-            cx_full = float(cf.crop_center_x) * sx
-            cy_full = float(cf.crop_center_y) * sy
+        # (可选) 你想定位体积差异时，可以临时打开这几行
+        print("exported frames:", frame_idx)
+        print("out size:", out_w, out_h, "fps:", float(fps_rate))
+        print("audio:", "enabled" if out_a is not None else "none", "copy" if audio_copy else "re-enc/none")
+        print("input bitrate:", in_br)
 
-            # 目标输出帧中心
-            dst_cx = out_w / 2.0
-            dst_cy = out_h / 2.0
-
-            dx = dst_cx - cx_full
-            dy = dst_cy - cy_full
-
-            M = np.float32([[1.0, 0.0, dx],
-                            [0.0, 1.0, dy]])
-
-            # 平移 + 黑边填充
-            try:
-                crop = cv2.warpAffine(
-                    frame,
-                    M,
-                    (out_w, out_h),
-                    flags=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=(0, 0, 0),
-                )
-            except cv2.error as e:
-                raise RuntimeError(
-                    f"export_stabilized_video: cv2.warpAffine failed at frame {frame_idx}: {e} | "
-                    f"center=({cx_full},{cy_full}), out=({out_w}x{out_h}), "
-                    f"frame=({frame_w}x{frame_h}), work=({work_width}x{work_height})"
-                ) from e
-
-            # ========= 打水印逻辑保持不变 =========
-            if add_brand_watermark:
-                h2, w2 = crop.shape[:2]
-
-                base = min(w2, h2)
-                scale = base / 1080.0
-                font_scale = max(0.5, min(1.8, base_font_scale * scale))
-
-                (text_w, text_h), baseline = cv2.getTextSize(
-                    brand_text, font, font_scale, thickness
-                )
-
-                margin = int(max(10, base * 0.02))
-                x_txt = max(margin, w2 - text_w - margin)
-                y_txt = margin + text_h
-
-                overlay = crop.copy()
-                pad_x = int(max(6, base * 0.01))
-                pad_y = int(max(4, base * 0.007))
-
-                bg_tl = (x_txt - pad_x, y_txt - text_h - pad_y)
-                bg_br = (x_txt + text_w + pad_x, y_txt + pad_y)
-                cv2.rectangle(overlay, bg_tl, bg_br, (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.4, crop, 0.6, 0, crop)
-
-                shadow_color = (0, 0, 0)
-                text_color = (255, 255, 255)
-
-                cv2.putText(
-                    crop,
-                    brand_text,
-                    (x_txt + 1, y_txt + 1),
-                    font,
-                    font_scale,
-                    shadow_color,
-                    thickness + 1,
-                    lineType=cv2.LINE_AA,
-                )
-                cv2.putText(
-                    crop,
-                    brand_text,
-                    (x_txt, y_txt),
-                    font,
-                    font_scale,
-                    text_color,
-                    thickness,
-                    lineType=cv2.LINE_AA,
-                )
-
-            writer.write(crop)
-
-            frame_idx += 1
-
-            if progress_cb is not None:
-                progress_cb(100.0 * frame_idx / float(max(1, total_frames)))
-
+    except Exception as e:
+        raise RuntimeError(f"export_stabilized_video: error: {e}") from e
     finally:
-        cap.release()
-        writer.release()
-
-
+        if in_container is not None:
+            try:
+                in_container.close()
+            except Exception:
+                pass
+        if out_container is not None:
+            try:
+                out_container.close()
+            except Exception:
+                pass

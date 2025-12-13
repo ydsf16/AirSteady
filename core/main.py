@@ -398,7 +398,7 @@ class ExportDialog(QDialog):
 
         # --- 导出格式（仅 mp4） ---
         self.format_combo = QComboBox()
-        self.format_combo.addItem("MP4 (.mp4)")
+        self.format_combo.addItem("mp4 (.mp4)")
         fmt_label = QLabel("导出格式：")
         fmt_tip = QLabel("内测版本只支持导出 mp4 格式，正式版本将支持更多格式。")
         fmt_tip.setWordWrap(True)
@@ -503,7 +503,7 @@ class ExportDialog(QDialog):
             self,
             "选择导出路径",
             init_dir,
-            "MP4 Video (*.mp4)",
+            "mp4 Video (*.mp4)",
         )
         if not path:
             return
@@ -1470,7 +1470,7 @@ class MainWindow(QMainWindow):
                     work_width=self.track_engine.scale_width,
                     work_height=self.track_engine.scale_height,
                     progress_cb=self._on_final_export_progress,
-                    add_brand_watermark=True,
+                    add_brand_watermark=False,
                 )
             else:
                 # 情况二：需要两阶段导出 (阶段1: 自动裁切尺寸; 阶段2: resize 到目标尺寸)
@@ -1487,7 +1487,7 @@ class MainWindow(QMainWindow):
                     work_width=self.track_engine.scale_width,
                     work_height=self.track_engine.scale_height,
                     progress_cb=stage1_cb,
-                    add_brand_watermark=True,
+                    add_brand_watermark=False,
                 )
 
                 # 阶段2：从自动裁切小视频 resize 到用户指定分辨率
@@ -1508,7 +1508,7 @@ class MainWindow(QMainWindow):
                 if h_out % 2 == 1:
                     h_out -= 1
 
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                fourcc = cv2.VideoWriter_fourcc(*"MJPG")
                 writer = cv2.VideoWriter(out_path, fourcc, fps, (w_out, h_out))
                 if not writer.isOpened():
                     cap.release()
@@ -1532,7 +1532,7 @@ class MainWindow(QMainWindow):
                 writer.release()
 
             # Copy video.
-            self._mux_audio_from_source(src_video, out_path)
+            # self._mux_audio_from_source(src_video, out_path)
 
             self._on_final_export_progress(100.0)
             self.status.showMessage(f"导出完成: {out_path}")
