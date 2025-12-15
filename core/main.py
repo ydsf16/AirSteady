@@ -618,6 +618,15 @@ class PlanAndPreviewWorker(QObject):
                 debug=False,
             )
 
+            # crop_traj = algorithm.refine_crop_traj_with_lowfreq(
+            #     crop_frames=crop_traj,
+            #     track_result=crop_traj,
+            #     keep_lowfreq=0.2,   # 0.2~0.6 is a reasonable range
+            #     inner_ratio=0.55,    # 0.45~0.7
+            #     tau_sec=1.2,         # 0.8~2.0 for long lens; larger => slower drift
+            #     debug=False,
+            # )
+
             print("[PlanAndPreviewWorker] planning done, start export preview...")
             # STEP2: 根据裁切结果导出预览用的小视频
             def _cb(p):
@@ -2210,7 +2219,7 @@ class ContactDialog(QDialog):
         intro = QLabel(
             "<b>关于作者</b><br>"
             "我是 AirSteady 的作者小葡萄爸爸，一名长期从事机器人、计算机视觉等方向的研发工程师。<br>"
-            "平时喜欢把复杂技术做成真正好用的小工具，AirSteady 就是把技术和个人兴趣结合的一次尝试。<br><br>"
+            "平时喜欢把复杂技术做成真正好用的工具，AirSteady 就是把技术和个人兴趣结合的一次尝试。<br><br>"
 
             "<b>关于航空与兴趣爱好</b><br>"
             "我是一名资深航空迷，曾多次前往各类航展现场，"
