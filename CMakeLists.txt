@@ -17,32 +17,57 @@ set(CMAKE_AUTOUIC ON)
 # ---------------- 依赖 ----------------
 find_package(Qt6 CONFIG REQUIRED COMPONENTS Core Gui Widgets)
 find_package(OpenCV REQUIRED)
+find_package(Glog REQUIRED)
+find_package(FFMPEG REQUIRED)
+message(STATUS "FFMPEG found: ${FFMPEG_FOUND}")
+find_package(cxxopts CONFIG REQUIRED)
+find_package(fmt CONFIG REQUIRED)
 
 include_directories(
     .
 )
 
-# ---------------- 源码列表 ----------------
-# 库的源码：不包含 exe/main.cpp
-set(AIRSTEADY_LIB_SOURCES
-    ui/main_window.cpp
-    ui/video_view.cpp
-    ui/control_panel.cpp
-    ui/export_dialog.cpp
-    ui/readme_dialog.cpp
-    ui/contact_dialog.cpp
+# # ---------------- 源码列表 ----------------
+# # 库的源码：不包含 exe/main.cpp
+# set(AIRSTEADY_LIB_SOURCES
+#     ui/main_window.cpp
+#     ui/video_view.cpp
+#     ui/control_panel.cpp
+#     ui/export_dialog.cpp
+#     ui/readme_dialog.cpp
+#     ui/contact_dialog.cpp
+# )
+
+# set(AIRSTEADY_LIB_HEADERS
+#     algorithm/processor.h
+
+#     ui/main_window.hpp
+#     ui/video_view.hpp
+#     ui/control_panel.hpp
+#     ui/export_dialog.hpp
+#     ui/readme_dialog.hpp
+#     ui/contact_dialog.hpp
+# )
+
+file(GLOB_RECURSE AIRSTEADY_LIB_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/ui/*.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/algorithm/*.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/common/*.cpp"
+  
 )
 
-set(AIRSTEADY_LIB_HEADERS
-    algorithm/processor.h
-
-    ui/main_window.hpp
-    ui/video_view.hpp
-    ui/control_panel.hpp
-    ui/export_dialog.hpp
-    ui/readme_dialog.hpp
-    ui/contact_dialog.hpp
+file(GLOB_RECURSE AIRSTEADY_LIB_HEADERS CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/ui/*.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/ui/*.hpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/algorithm/*.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/algorithm/*.hpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/common/*.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/common/*.hpp"
 )
+
+# Exclude patterns: *_exe.cpp and *_test.cpp
+list(FILTER AIRSTEADY_LIB_SOURCES EXCLUDE REGEX ".*_exe\\.cpp$")
+list(FILTER AIRSTEADY_LIB_SOURCES EXCLUDE REGEX ".*_test\\.cpp$")
 
 # Windows 默认用 STATIC，避免 DLL 导出/导入库问题
 if (WIN32)
@@ -73,6 +98,8 @@ target_link_libraries(airsteady_lib
         Qt6::Gui
         Qt6::Widgets
         ${OpenCV_LIBS}
+        glog::glog
+        ${FFMPEG_LIBRARIES}
 )
 
 # Windows MSVC 一些常用编译选项

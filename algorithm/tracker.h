@@ -1,0 +1,50 @@
+#pragma once
+
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include "common/types.h"
+#include "algorithm/video_preprocessor.h"
+
+namespace airsteady {
+
+class Tracker {
+ public:
+  explicit Tracker(VideoPreprocessor* video_preprocessor);
+  ~Tracker();
+  
+  bool StartTracking();
+  void StopTracking();
+
+  using TrackingResultCallback =
+      std::function<void(const FrameTrackingResultPreview& res)>;
+  using TrackFinishedCallback = std::function<void()>;
+
+  void AddTrackingResultCallback(TrackingResultCallback cb);
+  void AddTrackFinishedCallback(TrackFinishedCallback cb);
+
+  std::vector<FrameTrackingResult> GetTrackingResults() const;
+
+ private:
+  void Run();
+
+ private:
+  VideoPreprocessor* video_preprocessor_ = nullptr;
+
+  // Protects track_results_.
+  mutable std::mutex mutex_;
+  std::vector<FrameTrackingResult> track_results_;
+
+  std::shared_ptr<std::thread> thread_;
+
+  std::atomic<bool> stop_{false};
+
+  std::vector<TrackingResultCallback> tracking_result_cbs_;
+  std::vector<TrackFinishedCallback> track_finished_cbs_;
+};
+
+}  // namespace airsteady

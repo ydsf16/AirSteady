@@ -7,7 +7,17 @@
 
 namespace airsteady {
 
-Processor::Processor(const Config& config) : config_(config) {}
+Processor::Processor(const Config& config) : config_(config) {
+  std::string video_name;
+  GetVideoName(config_.video_path, &video_name);
+  const std::string proxy_path = config_.system_params.work_folder + "/" + video_name + "_proxy.mp4";
+  video_preprocessor_ = std::make_shared<VideoPreprocessor>(
+    config_.video_path,
+    proxy_path,
+    config_.system_params.max_porxy_resolution
+  );
+  tracker_ = std::make_shared<Tracker>(video_preprocessor_.get());
+}
 
 Processor::Processor(std::string work_folder) : work_folder_(std::move(work_folder)) {}
 
@@ -15,25 +25,10 @@ Processor::~Processor() = default;
 
 bool Processor::TryOpenVideo(std::string* err_info) {
   LOG(INFO) << "Try to open video: " << config_.video_path;
-
-  std::string video_name;
-  GetVideoName(config_.video_path, &video_name);
-  const std::string proxy_path = config_.system_params.work_folder + "/" + video_name + "_proxy.mp4";
-
-  LOG(INFO) << "Proxy path: " << proxy_path;
-  
-  video_preprocessor_ = std::make_shared<VideoPreprocessor>(
-    config_.video_path,
-    proxy_path,
-    config_.system_params.max_porxy_resolution
-  );
-
   bool ret = video_preprocessor_->TryOpenVideo(err_info);
-
   if (ret) {
     video_info_ = video_preprocessor_->GetVideoInfo();
   }
-
   LOG(INFO) << video_info_;
   return ret;
 }
@@ -54,18 +49,18 @@ bool Processor::GetVideoInfo(VideoInfo* video_info) const {
 }
 
 bool Processor::StartTracking(std::string* err_info) {
-  (void)err_info;
-  return false;
+  bool ret = tracker_->StartTracking();
+  return ret;
 }
 
 void Processor::StopTracking() {}
 
 void Processor::AddTrackingResultCallback(TrackingResultCallback cb) {
-  tracking_result_cbs_.push_back(std::move(cb));
+  tracker_->AddTrackingResultCallback(cb);
 }
 
 void Processor::AddTrackFinishedCallback(TrackFinishedCallback cb) {
-  track_finished_cbs_.push_back(std::move(cb));
+  tracker_->AddTrackFinishedCallback(cb);
 }
 
 bool Processor::StartStabilize(std::string* err_info) {

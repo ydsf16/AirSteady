@@ -6,6 +6,8 @@
 
 #include <opencv2/opencv.hpp>
 
+#include "algorithm/processor.h"
+
 class QLabel;
 class QPushButton;
 class QToolButton;
@@ -17,14 +19,6 @@ namespace airsteady {
 
 class VideoView;
 class ControlPanel;
-
-enum class AppState {
-  kIdle = 0,
-  kVideoLoaded,
-  kPlaying,
-  kPaused,
-  kExporting,
-};
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -52,27 +46,23 @@ class MainWindow : public QMainWindow {
   void onCropKeeRatioChanged(double keep_ratio);
 
   void onVideoViewClicked(double x_norm, double y_norm);
-
+  
   void onPlayTick();
+
+  // 算法结果回调函数
+  void OnTrackingResult(const FrameTrackingResult& res);
+  void OnTrackFinished();
+  void OnStablePlaneFinished();
 
  private:
   void buildUi();
-  void resetPreview();
-  void resetVideoViews();
-  void updateState(AppState new_state);
-
-  void togglePlayPause();
-  void seekToFrame(int frame_idx);
-  void updateTimeLabel(int frame_idx,
-                       int total_frames,
-                       double fps);
 
   // BGR Mat -> QPixmap
   QPixmap matToQPixmap(const cv::Mat& mat_bgr);
 
- private:
-  AppState state_ = AppState::kIdle;
+  void OnReceiveTrackingResult(const FrameTrackingResultPreview& track_preview);
 
+ private:
   // 顶部
   QPushButton* open_btn_ = nullptr;
   QPushButton* export_btn_ = nullptr;
@@ -95,6 +85,8 @@ class MainWindow : public QMainWindow {
   // 状态栏
   QStatusBar* status_bar_ = nullptr;
   QProgressBar* export_progress_ = nullptr;
+
+  std::shared_ptr<Processor> video_processor_;
 };
 
 }  // namespace airsteady

@@ -22,8 +22,13 @@
 #include <QEvent>
 #include <QKeyEvent>
 #include <QDebug>
+#include "common/file_utils.hpp"
+
+#include <glog/logging.h>
 
 namespace airsteady {
+
+const int kMaxProxyResolution = 1080; // 1080p.
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent) {
@@ -31,24 +36,12 @@ MainWindow::MainWindow(QWidget* parent)
   resize(1400, 800);
 
   buildUi();
-  updateState(AppState::kIdle);
 }
 
 MainWindow::~MainWindow() {
 }
 
 bool MainWindow::eventFilter(QObject* obj, QEvent* event) {
-  if (event->type() == QEvent::KeyPress) {
-    auto* key_event = static_cast<QKeyEvent*>(event);
-    if (key_event->key() == Qt::Key_Space) {
-      if (state_ == AppState::kVideoLoaded ||
-          state_ == AppState::kPlaying ||
-          state_ == AppState::kPaused) {
-        togglePlayPause();
-      }
-      return true;
-    }
-  }
   return QMainWindow::eventFilter(obj, event);
 }
 
@@ -158,88 +151,6 @@ void MainWindow::buildUi() {
           this, &MainWindow::onVideoViewClicked);
 }
 
-void MainWindow::resetPreview() {
-
-}
-
-void MainWindow::resetVideoViews() {
-
-}
-
-void MainWindow::updateState(AppState new_state) {
-  state_ = new_state;
-
-  open_btn_->setEnabled(true);
-  export_btn_->setEnabled(false);
-  play_btn_->setEnabled(false);
-  prev_btn_->setEnabled(false);
-  timeline_slider_->setEnabled(false);
-
-  raw_view_->setPlayIconVisible(false);
-  steady_view_->setPlayIconVisible(false);
-
-  switch (new_state) {
-    case AppState::kIdle: {
-      resetPreview();
-      resetVideoViews();
-      QString help_text =
-          tr("打开视频 -> 预览原始画面和稳像结果（当前稳像为占位显示）");
-      status_bar_->showMessage(help_text);
-      raw_view_->setOverlay(help_text, true);
-      steady_view_->setOverlay(help_text, true);
-      control_panel_->recomputeButton()->setEnabled(false);
-      break;
-    }
-    case AppState::kVideoLoaded: {
-      export_btn_->setEnabled(true);  // 当前导出仅做占位
-      play_btn_->setEnabled(true);
-      prev_btn_->setEnabled(true);
-      timeline_slider_->setEnabled(true);
-      control_panel_->recomputeButton()->setEnabled(false);
-      status_bar_->showMessage(tr("视频已加载，可以预览。"));
-      raw_view_->clearOverlay();
-      steady_view_->clearOverlay();
-      raw_view_->setPlayIconVisible(true);
-      steady_view_->setPlayIconVisible(true);
-      break;
-    }
-    case AppState::kPlaying: {
-      export_btn_->setEnabled(true);
-      play_btn_->setEnabled(true);
-      prev_btn_->setEnabled(true);
-      timeline_slider_->setEnabled(true);
-      status_bar_->showMessage(tr("播放中"));
-      raw_view_->setPlayIconVisible(false);
-      steady_view_->setPlayIconVisible(false);
-      break;
-    }
-    case AppState::kPaused: {
-      export_btn_->setEnabled(true);
-      play_btn_->setEnabled(true);
-      prev_btn_->setEnabled(true);
-      timeline_slider_->setEnabled(true);
-      status_bar_->showMessage(tr("已暂停"));
-      raw_view_->setPlayIconVisible(true);
-      steady_view_->setPlayIconVisible(true);
-      break;
-    }
-    case AppState::kExporting: {
-      open_btn_->setEnabled(false);
-      export_btn_->setEnabled(false);
-      play_btn_->setEnabled(false);
-      prev_btn_->setEnabled(false);
-      timeline_slider_->setEnabled(false);
-      control_panel_->recomputeButton()->setEnabled(false);
-      status_bar_->showMessage(tr("正在导出视频（占位实现）..."));
-      export_progress_->setVisible(true);
-      export_progress_->setValue(0);
-      steady_view_->setOverlay(
-          tr("正在导出视频（占位实现）..."), true, QColor(220, 220, 255));
-      break;
-    }
-  }
-}
-
 void MainWindow::onOpenClicked() {
   QString path = QFileDialog::getOpenFileName(
       this,
@@ -251,8 +162,48 @@ void MainWindow::onOpenClicked() {
     return;
   }
 
-  // Check path.
+  if (!IsFileExist(path.toStdString())) {
+    // TODO: Qmessage, bad image.
+    return;
+  }
 
+  std::string exe_folder;
+  if (!GetExeFolder(&exe_folder)) {
+    LOG(FATAL) << "Failed to get exe folder!!!";
+  }
+  Processor::Config config;
+  config.video_path = path.toStdString();
+  config.system_params.work_folder = exe_folder + "/work_folder";
+  CreateFolder(config.system_params.work_folder);
+
+  // TODO: Oth get from ui.
+  auto new_video_processor = std::make_shared<Processor>(config);
+  std::string err;
+  if (!new_video_processor->TryOpenVideo(&err)) {
+    QMessageBox::warning(
+      this,
+      tr("打开失败"),
+      tr("视频文件异常，请检查视频文件是否正常!"),
+      tr(err.c_str()));
+    return;
+  }
+  
+  // Stop old video processes.
+  if (video_processor_) {
+    video_processor_->StopAll();
+  }
+
+  // Assign to video_processor_.
+  video_processor_ = new_video_processor;
+
+  // TODO: Callbacks.
+  video_processor_->AddTrackingResultCallback(
+    [this](const FrameTrackingResultPreview& res) {
+      OnReceiveTrackingResult(res);
+    });
+
+  // Start tracking!!!
+  video_processor_->StartTracking(&err);
 }
 
 void MainWindow::onExportClicked() {
@@ -261,14 +212,9 @@ void MainWindow::onExportClicked() {
     return;
   }
 
-
 }
 
 void MainWindow::onPlayPauseClicked() {
-}
-
-void MainWindow::togglePlayPause() {
-  
 }
 
 void MainWindow::onPrevClicked() {
@@ -285,7 +231,6 @@ void MainWindow::onReadmeClicked() {
 }
 
 void MainWindow::onFeedbackClicked() {
-  // 按你的要求：问题反馈内部逻辑先清空，这里给一个占位提示即可。
   QMessageBox::information(
       this,
       tr("问题反馈"),
@@ -300,7 +245,6 @@ void MainWindow::onContactClicked() {
 
 void MainWindow::onSmoothChanged(double alpha) {
   qDebug() << "[UI] 镜头稳定程度更新:" << alpha;
-  // 当前 Demo 不触发重新运镜，未来可以在这里调用 Processor.UpdateParam...
 }
 
 void MainWindow::onCropKeeRatioChanged(double keep_ratio) {
@@ -315,13 +259,16 @@ void MainWindow::onPlayTick() {
 
 }
 
-void MainWindow::seekToFrame(int frame_idx) {
-  
+void MainWindow::OnTrackingResult(const FrameTrackingResult& res) {
+
 }
 
-void MainWindow::updateTimeLabel(int frame_idx,
-                                 int total_frames,
-                                 double fps) {
+void MainWindow::OnTrackFinished() {
+
+}
+
+void MainWindow::OnStablePlaneFinished() {
+
 }
 
 QPixmap MainWindow::matToQPixmap(const cv::Mat& mat_bgr) {
@@ -338,4 +285,9 @@ QPixmap MainWindow::matToQPixmap(const cv::Mat& mat_bgr) {
   return QPixmap::fromImage(img.copy());
 }
 
+void MainWindow::OnReceiveTrackingResult(const FrameTrackingResultPreview& track_preview) {
+  auto qpixel_img = matToQPixmap(track_preview.proxy_bgr);
+  raw_view_->setFramePixmap(qpixel_img);
+
+}
 }  // namespace airsteady

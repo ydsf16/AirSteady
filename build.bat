@@ -59,5 +59,5 @@ if exist "%EXE_PATH%" (
 )
 
 echo.
-pause
+@REM pause
 endlocal

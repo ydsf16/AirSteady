@@ -10,6 +10,7 @@
 
 #include "common/types.h"
 #include "algorithm/video_preprocessor.h"
+#include "algorithm/tracker.h"
 
 namespace airsteady {
 
@@ -116,14 +117,13 @@ class Processor {
   std::map<int, std::shared_ptr<FrameStableResult>> time_ns_stable_results_;
 
   // Callback registrations.
-  std::vector<TrackingResultCallback> tracking_result_cbs_;
-  std::vector<TrackFinishedCallback> track_finished_cbs_;
   std::vector<StableFinishedCallback> stable_finished_cbs_;
   std::vector<PreviewCallback> preview_cbs_;
   std::vector<ExportProgressCallback> export_progress_cbs_;
 
   // Subprocessor.s
   std::shared_ptr<VideoPreprocessor> video_preprocessor_;
+  std::shared_ptr<Tracker> tracker_;
 };
 
 }  // namespace airsteady

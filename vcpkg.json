@@ -12,6 +12,7 @@
       "features": [
         "avcodec",
         "avformat",
+        "avfilter",
         "swscale",
         "swresample",
         "gpl",

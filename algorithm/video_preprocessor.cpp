@@ -1,7 +1,10 @@
 #include "video_preprocessor.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <stdexcept>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -9,6 +12,7 @@ extern "C" {
 #include <libavutil/avutil.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/pixdesc.h>
 }
 
 namespace airsteady {
@@ -26,9 +30,48 @@ double RationalToDouble(AVRational r) {
   return static_cast<double>(r.num) / static_cast<double>(r.den);
 }
 
+// Try create HW device (best-effort).
+AVBufferRef* TryCreateHwDeviceCtx(bool verbose, AVHWDeviceType* out_type) {
+  const AVHWDeviceType pref[] = {
+      AV_HWDEVICE_TYPE_D3D11VA,
+      AV_HWDEVICE_TYPE_DXVA2,
+      AV_HWDEVICE_TYPE_CUDA,
+      AV_HWDEVICE_TYPE_QSV,
+      // AV_HWDEVICE_TYPE_D3D12VA,  // 老版本 FFmpeg 没这个，先不启用
+      AV_HWDEVICE_TYPE_VAAPI,
+      AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+  };
+
+  if (out_type) *out_type = AV_HWDEVICE_TYPE_NONE;
+
+  for (AVHWDeviceType t : pref) {
+    if (t == AV_HWDEVICE_TYPE_NONE) continue;
+    AVBufferRef* dev = nullptr;
+    int ret = av_hwdevice_ctx_create(&dev, t, nullptr, nullptr, 0);
+    if (ret == 0 && dev) {
+      if (out_type) *out_type = t;
+      if (verbose) {
+        LOG(INFO) << "[VideoPreprocessor] Using HW device: "
+                  << av_hwdevice_get_type_name(t);
+      }
+      return dev;
+    }
+    if (verbose) {
+      LOG(INFO) << "[VideoPreprocessor] HW device "
+                << av_hwdevice_get_type_name(t)
+                << " not available: " << AvErr2Str(ret);
+    }
+  }
+
+  if (verbose) {
+    LOG(INFO) << "[VideoPreprocessor] No HW device available; using SW decode.";
+  }
+  return nullptr;
+}
+
 }  // namespace
 
-// ---------------- ProxyVideoWriter (minimal internal helper) ----------------
+// ---------------- ProxyVideoWriter (HW encode preferred) ----------------
 
 class ProxyVideoWriter {
  public:
@@ -48,6 +91,7 @@ class ProxyVideoWriter {
   AVFrame* frame_ = nullptr;
   AVPacket* pkt_ = nullptr;
 
+  std::string encoder_name_;
   int frame_idx_ = 0;
 };
 
@@ -66,50 +110,103 @@ void ProxyVideoWriter::Open(const std::string& path, int w, int h, double fps) {
     throw std::runtime_error("avformat_alloc_output_context2 failed: " + AvErr2Str(ret));
   }
 
-  const AVCodec* codec = avcodec_find_encoder_by_name("libx264");
-  if (!codec) {
-    LOG(ERROR) << "[ProxyVideoWriter] libx264 encoder not found";
-    throw std::runtime_error("libx264 not found");
-  }
-
-  enc_ctx_ = avcodec_alloc_context3(codec);
-  if (!enc_ctx_) {
-    LOG(ERROR) << "[ProxyVideoWriter] avcodec_alloc_context3 failed";
-    throw std::runtime_error("avcodec_alloc_context3 failed");
-  }
-
-  enc_ctx_->width = w;
-  enc_ctx_->height = h;
-  enc_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
-  enc_ctx_->time_base = AVRational{1, static_cast<int>(fps + 0.5)};
-  if (enc_ctx_->time_base.den <= 0) enc_ctx_->time_base.den = 30;
-  enc_ctx_->framerate = AVRational{static_cast<int>(fps + 0.5), 1};
-  enc_ctx_->gop_size = 60;
-  enc_ctx_->max_b_frames = 0;
-
-  if (fmt_->oformat->flags & AVFMT_GLOBALHEADER) {
-    enc_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-  }
-
-  ret = avcodec_open2(enc_ctx_, codec, nullptr);
-  if (ret < 0) {
-    LOG(ERROR) << "[ProxyVideoWriter] avcodec_open2 failed: " << AvErr2Str(ret);
-    avcodec_free_context(&enc_ctx_);
-    throw std::runtime_error("avcodec_open2 failed: " + AvErr2Str(ret));
-  }
-
   stream_ = avformat_new_stream(fmt_, nullptr);
   if (!stream_) {
     LOG(ERROR) << "[ProxyVideoWriter] avformat_new_stream failed";
     throw std::runtime_error("avformat_new_stream failed");
   }
 
+  AVRational time_base{1, static_cast<int>(fps + 0.5)};
+  if (time_base.den <= 0) time_base.den = 30;
+
+  enc_ctx_ = avcodec_alloc_context3(nullptr);
+  if (!enc_ctx_) {
+    LOG(ERROR) << "[ProxyVideoWriter] avcodec_alloc_context3 failed";
+    throw std::runtime_error("avcodec_alloc_context3 failed");
+  }
+  enc_ctx_->width = w;
+  enc_ctx_->height = h;
+  enc_ctx_->time_base = time_base;
+  enc_ctx_->framerate = AVRational{time_base.den, time_base.num};
+  enc_ctx_->gop_size = 60;
+  enc_ctx_->max_b_frames = 0;
+  enc_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
+
+  if (fmt_->oformat->flags & AVFMT_GLOBALHEADER) {
+    enc_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+  }
+
+  const std::vector<const char*> enc_names = {
+      "h264_nvenc",
+      "h264_qsv",
+      "h264_amf",
+      "h264_mf",
+      "libx264",
+      "h264",
+      "mpeg4",
+  };
+
+  bool opened = false;
+  for (const char* name : enc_names) {
+    const AVCodec* codec = avcodec_find_encoder_by_name(name);
+    if (!codec) {
+      LOG(INFO) << "[ProxyVideoWriter] Encoder not found: " << name;
+      continue;
+    }
+
+    avcodec_free_context(&enc_ctx_);
+    enc_ctx_ = avcodec_alloc_context3(codec);
+    if (!enc_ctx_) {
+      LOG(ERROR) << "[ProxyVideoWriter] avcodec_alloc_context3 failed for " << name;
+      continue;
+    }
+
+    enc_ctx_->width = w;
+    enc_ctx_->height = h;
+    enc_ctx_->time_base = time_base;
+    enc_ctx_->framerate = AVRational{time_base.den, time_base.num};
+    enc_ctx_->gop_size = 60;
+    enc_ctx_->max_b_frames = 0;
+
+    enc_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
+    if (codec->pix_fmts) {
+      enc_ctx_->pix_fmt = codec->pix_fmts[0];
+      for (const AVPixelFormat* pf = codec->pix_fmts; *pf != AV_PIX_FMT_NONE; ++pf) {
+        if (*pf == AV_PIX_FMT_YUV420P) {
+          enc_ctx_->pix_fmt = *pf;
+          break;
+        }
+      }
+    }
+
+    if (fmt_->oformat->flags & AVFMT_GLOBALHEADER) {
+      enc_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
+    ret = avcodec_open2(enc_ctx_, codec, nullptr);
+    if (ret < 0) {
+      LOG(WARNING) << "[ProxyVideoWriter] avcodec_open2 failed for encoder "
+                   << name << ": " << AvErr2Str(ret);
+      avcodec_free_context(&enc_ctx_);
+      continue;
+    }
+
+    encoder_name_ = codec->name ? codec->name : "unknown";
+    LOG(INFO) << "[ProxyVideoWriter] Selected encoder: " << encoder_name_;
+    opened = true;
+    break;
+  }
+
+  if (!opened) {
+    throw std::runtime_error("No usable encoder found (tried hw encoders + libx264/h264/mpeg4).");
+  }
+
+  stream_->time_base = enc_ctx_->time_base;
   ret = avcodec_parameters_from_context(stream_->codecpar, enc_ctx_);
   if (ret < 0) {
     LOG(ERROR) << "[ProxyVideoWriter] avcodec_parameters_from_context failed: " << AvErr2Str(ret);
     throw std::runtime_error("avcodec_parameters_from_context failed: " + AvErr2Str(ret));
   }
-  stream_->time_base = enc_ctx_->time_base;
 
   if (!(fmt_->oformat->flags & AVFMT_NOFILE)) {
     ret = avio_open(&fmt_->pb, path.c_str(), AVIO_FLAG_WRITE);
@@ -152,6 +249,9 @@ void ProxyVideoWriter::Open(const std::string& path, int w, int h, double fps) {
     LOG(ERROR) << "[ProxyVideoWriter] av_packet_alloc failed";
     throw std::runtime_error("av_packet_alloc failed");
   }
+
+  LOG(INFO) << "[ProxyVideoWriter] Opened with encoder=" << encoder_name_
+            << " pix_fmt=" << av_get_pix_fmt_name(enc_ctx_->pix_fmt);
 }
 
 void ProxyVideoWriter::Write(const cv::Mat& bgr) {
@@ -235,11 +335,13 @@ void ProxyVideoWriter::Close() {
         LOG(WARNING) << "[ProxyVideoWriter] avcodec_receive_packet(flush) failed: " << AvErr2Str(ret);
         break;
       }
-      av_packet_rescale_ts(pkt_, enc_ctx_->time_base, stream_ ? stream_->time_base : enc_ctx_->time_base);
+      av_packet_rescale_ts(pkt_, enc_ctx_->time_base,
+                           stream_ ? stream_->time_base : enc_ctx_->time_base);
       if (stream_) pkt_->stream_index = stream_->index;
       int wret = av_interleaved_write_frame(fmt_, pkt_);
       if (wret < 0) {
-        LOG(WARNING) << "[ProxyVideoWriter] av_interleaved_write_frame(flush) failed: " << AvErr2Str(wret);
+        LOG(WARNING) << "[ProxyVideoWriter] av_interleaved_write_frame(flush) failed: "
+                     << AvErr2Str(wret);
         av_packet_unref(pkt_);
         break;
       }
@@ -272,10 +374,11 @@ void ProxyVideoWriter::Close() {
   enc_ctx_ = nullptr;
   fmt_ = nullptr;
   stream_ = nullptr;
+  encoder_name_.clear();
   frame_idx_ = 0;
 }
 
-// ---------------- VideoPreprocessor ----------------
+// ---------------- VideoPreprocessor (decode + CPU resize + prefetch) ----------------
 
 VideoPreprocessor::VideoPreprocessor(const std::string& src,
                                      const std::string& proxy,
@@ -299,6 +402,7 @@ VideoPreprocessor::~VideoPreprocessor() {
   if (pkt_) av_packet_free(&pkt_);
   if (dec_ctx_) avcodec_free_context(&dec_ctx_);
   if (fmt_) avformat_close_input(&fmt_);
+  if (hw_device_ctx_) av_buffer_unref(&hw_device_ctx_);
 }
 
 bool VideoPreprocessor::TryOpenVideo(std::string* err) {
@@ -343,11 +447,13 @@ bool VideoPreprocessor::TryOpenVideo(std::string* err) {
     fps = RationalToDouble(fr);
   }
   if (fps <= 0.0) fps = 30.0;
-  LOG(INFO) << "[VideoPreprocessor] Proxy fps=" << fps;
+  fps_hint_ = fps;
+
+  LOG(INFO) << "[VideoPreprocessor] Proxy fps=" << fps_hint_;
 
   try {
     proxy_writer_ = std::make_unique<ProxyVideoWriter>();
-    proxy_writer_->Open(proxy_path_, proxy_w_, proxy_h_, fps);
+    proxy_writer_->Open(proxy_path_, proxy_w_, proxy_h_, fps_hint_);
   } catch (const std::exception& e) {
     LOG(ERROR) << "[VideoPreprocessor] Failed to open proxy writer: " << e.what();
     if (err) *err = e.what();
@@ -380,11 +486,28 @@ std::shared_ptr<PreFrame> VideoPreprocessor::NextFrame() {
   queue_.pop_front();
   cv_not_full_.notify_one();
 
-  VLOG(2) << "[VideoPreprocessor] NextFrame: idx=" << f->frame_idx
-          << " time_ns=" << f->time_ns
-          << " remaining_queue=" << queue_.size();
+  // LOG(INFO) << "[VideoPreprocessor] NextFrame: idx=" << f->frame_idx
+  //         << " time_ns=" << f->time_ns
+  //         << " remaining_queue=" << queue_.size();
 
   return f;
+}
+
+// ---------------- HW decode helper: get_format callback ----------------
+
+enum AVPixelFormat VideoPreprocessor::GetHwFormat(AVCodecContext* ctx,
+                                                  const enum AVPixelFormat* pix_fmts) {
+  auto* self = reinterpret_cast<VideoPreprocessor*>(ctx->opaque);
+  for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+    if (*p == self->hw_pix_fmt_) {
+      LOG(INFO) << "[VideoPreprocessor] GetHwFormat: selecting HW pix_fmt="
+              << av_get_pix_fmt_name(*p);
+      return *p;
+    }
+  }
+  LOG(INFO) << "[VideoPreprocessor] GetHwFormat: HW pix_fmt not found, fallback to "
+          << av_get_pix_fmt_name(pix_fmts[0]);
+  return pix_fmts[0];
 }
 
 bool VideoPreprocessor::InitFFmpeg(std::string* err) {
@@ -441,6 +564,38 @@ bool VideoPreprocessor::InitFFmpeg(std::string* err) {
     return false;
   }
 
+  // Try HW decode best-effort.
+  using_hw_decode_ = false;
+  hw_pix_fmt_ = AV_PIX_FMT_NONE;
+  hw_device_type_ = AV_HWDEVICE_TYPE_NONE;
+
+  hw_device_ctx_ = TryCreateHwDeviceCtx(/*verbose=*/true, &hw_device_type_);
+  if (hw_device_ctx_) {
+    // Find decoder HW config that matches this device type.
+    for (int i = 0;; ++i) {
+      const AVCodecHWConfig* cfg = avcodec_get_hw_config(dec, i);
+      if (!cfg) break;
+      if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
+          cfg->device_type == hw_device_type_) {
+        hw_pix_fmt_ = cfg->pix_fmt;
+        break;
+      }
+    }
+
+    if (hw_pix_fmt_ != AV_PIX_FMT_NONE) {
+      dec_ctx_->opaque = this;
+      dec_ctx_->get_format = &VideoPreprocessor::GetHwFormat;
+      dec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
+      LOG(INFO) << "[VideoPreprocessor] HW decode enabled: device="
+                << av_hwdevice_get_type_name(hw_device_type_)
+                << " hw_pix_fmt=" << av_get_pix_fmt_name(hw_pix_fmt_);
+    } else {
+      LOG(WARNING) << "[VideoPreprocessor] HW device created but decoder has no matching HW config; fallback to SW.";
+      av_buffer_unref(&hw_device_ctx_);
+      hw_device_ctx_ = nullptr;
+    }
+  }
+
   ret = avcodec_open2(dec_ctx_, dec, nullptr);
   if (ret < 0) {
     std::string msg = "avcodec_open2 failed: " + AvErr2Str(ret);
@@ -448,6 +603,8 @@ bool VideoPreprocessor::InitFFmpeg(std::string* err) {
     if (err) *err = msg;
     return false;
   }
+
+  using_hw_decode_ = (hw_device_ctx_ && hw_pix_fmt_ != AV_PIX_FMT_NONE);
 
   src_w_ = dec_ctx_->width;
   src_h_ = dec_ctx_->height;
@@ -465,7 +622,6 @@ bool VideoPreprocessor::InitFFmpeg(std::string* err) {
 
   info_.num_frames = static_cast<int>(video_st_->nb_frames);
 
-  // Log basic info.
   double fps_guess = 0.0;
   if (video_st_->avg_frame_rate.num && video_st_->avg_frame_rate.den) {
     fps_guess = RationalToDouble(video_st_->avg_frame_rate);
@@ -478,7 +634,12 @@ bool VideoPreprocessor::InitFFmpeg(std::string* err) {
             << " bitrate=" << info_.bitrate
             << " duration_sec=" << info_.total_time_sec
             << " nb_frames=" << info_.num_frames
-            << " fps_guess=" << fps_guess;
+            << " fps_guess=" << fps_guess
+            << " using_hw_decode=" << (using_hw_decode_ ? 1 : 0)
+            << " hw_device_type="
+            << (hw_device_type_ != AV_HWDEVICE_TYPE_NONE
+                    ? av_hwdevice_get_type_name(hw_device_type_)
+                    : "none");
 
   pkt_ = av_packet_alloc();
   frame_ = av_frame_alloc();
@@ -493,7 +654,7 @@ bool VideoPreprocessor::InitFFmpeg(std::string* err) {
   return true;
 }
 
-bool VideoPreprocessor::DecodeOneFrame(AVFrame* out) {
+bool VideoPreprocessor::DecodeOneFrame(AVFrame** out_frame) {
   while (true) {
     int ret = av_read_frame(fmt_, pkt_);
     if (ret == AVERROR_EOF) {
@@ -517,9 +678,8 @@ bool VideoPreprocessor::DecodeOneFrame(AVFrame* out) {
       continue;
     }
 
-    ret = avcodec_receive_frame(dec_ctx_, out);
+    ret = avcodec_receive_frame(dec_ctx_, frame_);
     if (ret == AVERROR(EAGAIN)) {
-      // Need more packets.
       continue;
     }
     if (ret < 0) {
@@ -527,15 +687,37 @@ bool VideoPreprocessor::DecodeOneFrame(AVFrame* out) {
       return false;
     }
 
-    VLOG(3) << "[VideoPreprocessor] Decoded frame: pts=" << out->pts
-            << " best_effort_ts=" << out->best_effort_timestamp
-            << " size=" << out->width << "x" << out->height;
+    AVFrame* src = frame_;
+    const AVPixelFormat fmt = static_cast<AVPixelFormat>(frame_->format);
+    const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(fmt);
+    const bool is_hw_frame = desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL);
+
+    if (using_hw_decode_ && is_hw_frame) {
+      av_frame_unref(sw_frame_);
+      int tret = av_hwframe_transfer_data(sw_frame_, frame_, 0);
+      if (tret < 0) {
+        LOG(WARNING) << "[VideoPreprocessor] av_hwframe_transfer_data failed; using HW frame directly. err="
+                     << AvErr2Str(tret);
+        src = frame_;
+      } else {
+        src = sw_frame_;
+      }
+    }
+
+    *out_frame = src;
+
+    // LOG(INFO) << "[VideoPreprocessor] Decoded frame: pts=" << src->pts
+    //         << " best_effort_ts=" << src->best_effort_timestamp
+    //         << " size=" << src->width << "x" << src->height
+    //         << " fmt=" << av_get_pix_fmt_name(static_cast<AVPixelFormat>(src->format));
     return true;
   }
 }
 
 void VideoPreprocessor::PrefetchThread() {
   LOG(INFO) << "[VideoPreprocessor] PrefetchThread started";
+
+  using Clock = std::chrono::steady_clock;
 
   while (!stop_) {
     {
@@ -550,28 +732,41 @@ void VideoPreprocessor::PrefetchThread() {
       break;
     }
 
-    if (!DecodeOneFrame(frame_)) {
+    auto t_total_start = Clock::now();
+
+    // -------- 1) 解码阶段 --------
+    auto t_decode_start = Clock::now();
+
+    AVFrame* src_frame = nullptr;
+    if (!DecodeOneFrame(&src_frame)) {
       eof_ = true;
       LOG(INFO) << "[VideoPreprocessor] PrefetchThread: DecodeOneFrame returned false, EOF or error";
       cv_not_empty_.notify_all();
       break;
     }
 
+    auto t_decode_end = Clock::now();
+
+    // -------- 2) Resize 阶段（sws_scale）--------
+    auto t_resize_start = t_decode_end;
+
+    // CPU resize using sws_scale.
     if (!sws_) {
-      sws_ = sws_getContext(frame_->width, frame_->height,
-                            static_cast<AVPixelFormat>(frame_->format),
+      sws_ = sws_getContext(src_frame->width, src_frame->height,
+                            static_cast<AVPixelFormat>(src_frame->format),
                             proxy_w_, proxy_h_,
                             AV_PIX_FMT_BGR24,
-                            SWS_BILINEAR, nullptr, nullptr, nullptr);
+                            SWS_FAST_BILINEAR,// SWS_BILINEAR
+                             nullptr, nullptr, nullptr);
       if (!sws_) {
         LOG(ERROR) << "[VideoPreprocessor] sws_getContext failed, stopping prefetch thread";
         eof_ = true;
         cv_not_empty_.notify_all();
         break;
       }
-      LOG(INFO) << "[VideoPreprocessor] sws context created: src_fmt="
-                << av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame_->format))
-                << " src_size=" << frame_->width << "x" << frame_->height
+      LOG(INFO) << "[VideoPreprocessor] CPU sws context created: src_fmt="
+                << av_get_pix_fmt_name(static_cast<AVPixelFormat>(src_frame->format))
+                << " src_size=" << src_frame->width << "x" << src_frame->height
                 << " dst_size=" << proxy_w_ << "x" << proxy_h_;
     }
 
@@ -579,45 +774,104 @@ void VideoPreprocessor::PrefetchThread() {
     uint8_t* dst[4] = {bgr.data, nullptr, nullptr, nullptr};
     int dst_stride[4] = {static_cast<int>(bgr.step), 0, 0, 0};
 
-    int ret = sws_scale(sws_, frame_->data, frame_->linesize,
-                        0, frame_->height, dst, dst_stride);
-    if (ret <= 0) {
-      LOG(ERROR) << "[VideoPreprocessor] sws_scale failed in PrefetchThread, ret=" << ret;
+    int sret = sws_scale(sws_, src_frame->data, src_frame->linesize,
+                         0, src_frame->height, dst, dst_stride);
+    if (sret <= 0) {
+      LOG(ERROR) << "[VideoPreprocessor] sws_scale failed in PrefetchThread, ret=" << sret;
       eof_ = true;
       cv_not_empty_.notify_all();
       break;
     }
 
+    auto t_resize_end = Clock::now();
+
+    // -------- 3) 写 proxy 视频 --------
+    auto t_write_start = t_resize_end;
+
     if (proxy_writer_) {
       proxy_writer_->Write(bgr);
     }
+
+    auto t_write_end = Clock::now();
+
+    // -------- 4) 组装 PreFrame + timestamp + 入队 --------
+    auto t_post_start = t_write_end;
 
     auto pf = std::make_shared<PreFrame>();
     pf->frame_idx = frame_idx_++;
     pf->proxy_bgr = bgr;
     cv::cvtColor(bgr, pf->proxy_gray, cv::COLOR_BGR2GRAY);
 
-    int64_t pts = (frame_->best_effort_timestamp != AV_NOPTS_VALUE)
-                      ? frame_->best_effort_timestamp
-                      : frame_->pts;
-    if (pts == AV_NOPTS_VALUE) pts = 0;
+    // ---- 计算 time_ns（兼容旧 FFmpeg + 没有 PTS 的情况）----
+    int64_t pts = AV_NOPTS_VALUE;
+    if (src_frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+      pts = src_frame->best_effort_timestamp;
+    } else if (src_frame->pts != AV_NOPTS_VALUE) {
+      pts = src_frame->pts;
+    }
 
-    double t_sec = pts * RationalToDouble(video_st_->time_base);
-    pf->time_ns = static_cast<int64_t>(t_sec * 1e9);
+    AVRational tb{0, 1};
+    if (video_st_) {
+      tb = video_st_->time_base;
+    }
+    if (tb.num <= 0 || tb.den <= 0) {
+      if (dec_ctx_) {
+        tb = dec_ctx_->time_base;
+        LOG(WARNING) << "[VideoPreprocessor] stream time_base invalid, "
+                     << "fallback to decoder time_base=" << tb.num << "/" << tb.den;
+      }
+    }
+
+    int64_t ts_ns = 0;
+    if (pts != AV_NOPTS_VALUE && tb.num > 0 && tb.den > 0) {
+      AVRational ns_tb{1, 1000000000};  // 1/1e9 秒
+      ts_ns = av_rescale_q(pts, tb, ns_tb);
+    } else if (fps_hint_ > 0.0) {
+      double sec = static_cast<double>(pf->frame_idx) / fps_hint_;
+      ts_ns = static_cast<int64_t>(sec * 1e9);
+    } else {
+      // 实在没办法，就保持 0（极少见）
+    }
+
+    pf->time_ns = ts_ns;
 
     {
       std::lock_guard lk(mtx_);
       queue_.push_back(pf);
-      VLOG(2) << "[VideoPreprocessor] Prefetched frame idx=" << pf->frame_idx
-              << " time_ns=" << pf->time_ns
-              << " queue_size=" << queue_.size();
     }
     cv_not_empty_.notify_one();
 
+    auto t_post_end = Clock::now();
+    auto t_total_end = t_post_end;
+
+    // -------- 5) 统计各阶段耗时 --------
+    double decode_ms = std::chrono::duration<double, std::milli>(t_decode_end - t_decode_start).count();
+    double resize_ms = std::chrono::duration<double, std::milli>(t_resize_end - t_resize_start).count();
+    double write_ms  = std::chrono::duration<double, std::milli>(t_write_end   - t_write_start).count();
+    double post_ms   = std::chrono::duration<double, std::milli>(t_post_end    - t_post_start).count();
+    double total_ms  = std::chrono::duration<double, std::milli>(t_total_end   - t_total_start).count();
+
+    double rt_factor = (fps_hint_ > 0.0 && total_ms > 0.0)
+                           ? (1000.0 / (total_ms * fps_hint_))
+                           : 0.0;
+
+    LOG(INFO) << "[VideoPreprocessor] Frame " << pf->frame_idx
+              << " total=" << total_ms << " ms"
+              << " (decode=" << decode_ms
+              << " ms, resize=" << resize_ms
+              << " ms, write=" << write_ms
+              << " ms, post=" << post_ms << " ms)"
+              << " realtime_factor=" << rt_factor
+              << " using_hw_decode=" << (using_hw_decode_ ? 1 : 0)
+              << " gpu_resize=0";  // 现在没有 GPU resize
+
     av_frame_unref(frame_);
+    av_frame_unref(sw_frame_);
   }
 
+  proxy_writer_->Close();
   LOG(INFO) << "[VideoPreprocessor] PrefetchThread exit, total_frames=" << frame_idx_;
 }
+
 
 }  // namespace airsteady
