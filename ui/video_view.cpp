@@ -1,250 +1,518 @@
-#include "video_view.hpp"
+#include "ui/video_view.hpp"
 
 #include <QPainter>
+#include <QPaintEvent>
 #include <QMouseEvent>
-#include <QFont>
 #include <QFontMetrics>
-#include <QRadialGradient>
-#include <QPen>
-#include <QPolygonF>
+#include <QMetaObject>
+
+#include <algorithm>
+#include <cmath>
 
 namespace airsteady {
+
+namespace {
+inline double Clamp(double v, double lo, double hi) {
+  return std::max(lo, std::min(v, hi));
+}
+}  // namespace
 
 VideoView::VideoView(const QString& title, QWidget* parent)
     : QWidget(parent), title_(title) {
   setMinimumSize(320, 240);
+  setMouseTracking(true);
 }
 
-void VideoView::setFramePixmap(const QPixmap& pixmap) {
-  pixmap_ = pixmap;
-  has_frame_ = !pixmap_.isNull();
-  update();
-}
+void VideoView::SetTrackFrame(const FrameTrackingResultPreview& track_res) {
+  // Deep copy image first (so we drop any dependency on caller's cv::Mat buffer).
+  QImage img_copy = CvMatToQImageDeepCopy(track_res.proxy_bgr);
 
-void VideoView::clearFrame() {
-  pixmap_ = QPixmap();
-  has_frame_ = false;
-  last_draw_rect_ = QRectF();
-  update();
-}
+  DrawOverlay ov = BuildOverlayFromSegRes(track_res.seg_detect_res);
 
-void VideoView::setOverlay(const QString& text,
-                           bool center,
-                           const QColor& color) {
-  overlay_text_ = text;
-  has_overlay_ = !overlay_text_.isEmpty();
-  overlay_center_ = center;
-  if (color.isValid()) {
-    overlay_color_ = color;
-  } else {
-    overlay_color_ = QColor(255, 255, 255);
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    mode_ = RenderMode::kTracking;
+    img_ = std::move(img_copy);
+    has_frame_ = !img_.isNull();
+    overlay_ = std::move(ov);
+
+    has_stable_ = false;
+    global_offset_px_ = Eigen::Vector2d::Zero();
+    stable_res_ = FrameStableResult{};
   }
-  update();
+
+  RequestRepaintAsync();
 }
 
-void VideoView::clearOverlay() {
-  overlay_text_.clear();
-  has_overlay_ = false;
-  update();
-}
+void VideoView::SetPreviewFrame(const FramePreview& frame_preview,
+                                const Eigen::Vector2d& global_offset,
+                                bool left) {
+  QImage img_copy = CvMatToQImageDeepCopy(frame_preview.proxy_bgr);
 
-void VideoView::setWarnOverlay(const QString& text,
-                               const QColor& color) {
-  warn_overlay_text_ = text;
-  has_warn_overlay_ = !warn_overlay_text_.isEmpty();
-  if (color.isValid()) {
-    warn_overlay_color_ = color;
-  } else {
-    warn_overlay_color_ = QColor(255, 200, 200);
+  std::optional<DrawOverlay> ov;
+  if (left) {
+    // Left preview shows tracking overlay.
+    ov = BuildOverlayFromSegRes(frame_preview.track_res.seg_detect_res);
   }
-  update();
+
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    mode_ = left ? RenderMode::kPreviewLeft : RenderMode::kPreviewRight;
+    img_ = std::move(img_copy);
+    has_frame_ = !img_.isNull();
+
+    overlay_ = ov;
+
+    global_offset_px_ = global_offset;
+    stable_res_ = frame_preview.stable_res;
+    has_stable_ = !left;  // only meaningful for right preview
+  }
+
+  RequestRepaintAsync();
 }
 
-void VideoView::clearWarnOverlay() {
-  warn_overlay_text_.clear();
-  has_warn_overlay_ = false;
-  update();
+void VideoView::ClearFrame() {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    mode_ = RenderMode::kNone;
+    img_ = QImage();
+    has_frame_ = false;
+    overlay_.reset();
+
+    has_stable_ = false;
+    global_offset_px_ = Eigen::Vector2d::Zero();
+    stable_res_ = FrameStableResult{};
+  }
+  RequestRepaintAsync();
 }
 
-void VideoView::setTargetRectNorm(const QRectF& rect_norm) {
-  target_rect_norm_ = rect_norm;
-  has_target_rect_ = true;
-  update();
+void VideoView::SetOverlay(const QString& text, bool center, const QColor& color) {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    overlay_text_ = text;
+    overlay_center_ = center;
+    overlay_color_ = color.isValid() ? color : QColor(255, 255, 255);
+    has_overlay_ = !overlay_text_.isEmpty();
+  }
+  RequestRepaintAsync();
 }
 
-void VideoView::clearTargetRect() {
-  has_target_rect_ = false;
-  update();
+void VideoView::ClearOverlay() {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    overlay_text_.clear();
+    has_overlay_ = false;
+  }
+  RequestRepaintAsync();
 }
 
-void VideoView::setPlayIconVisible(bool visible) {
-  show_play_icon_ = visible;
-  update();
+void VideoView::SetWarnOverlay(const QString& text, const QColor& color) {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    warn_overlay_text_ = text;
+    warn_overlay_color_ = color.isValid() ? color : QColor(255, 180, 0);
+    has_warn_overlay_ = !warn_overlay_text_.isEmpty();
+  }
+  RequestRepaintAsync();
+}
+
+void VideoView::ClearWarnOverlay() {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    warn_overlay_text_.clear();
+    has_warn_overlay_ = false;
+  }
+  RequestRepaintAsync();
+}
+
+void VideoView::RequestRepaintAsync() {
+  // Ensure repaint request happens on UI thread even if setters are called from workers.
+  QMetaObject::invokeMethod(this, [this]() { this->update(); }, Qt::QueuedConnection);
+}
+
+QImage VideoView::CvMatToQImageDeepCopy(const cv::Mat& mat) {
+  if (mat.empty()) return QImage();
+
+  cv::Mat src = mat;
+  if (!src.isContinuous()) {
+    src = src.clone();
+  }
+
+  if (src.type() == CV_8UC3) {
+    // OpenCV default: BGR
+    QImage img(reinterpret_cast<const uchar*>(src.data),
+               src.cols, src.rows,
+               static_cast<int>(src.step),
+               QImage::Format_BGR888);
+    return img.copy();  // deep copy
+  }
+
+  if (src.type() == CV_8UC1) {
+    QImage img(reinterpret_cast<const uchar*>(src.data),
+               src.cols, src.rows,
+               static_cast<int>(src.step),
+               QImage::Format_Grayscale8);
+    return img.copy();
+  }
+
+  // Fallback: convert to BGR8
+  cv::Mat bgr;
+  if (src.channels() == 4) {
+    cv::cvtColor(src, bgr, cv::COLOR_BGRA2BGR);
+  } else {
+    src.convertTo(bgr, CV_8UC3);
+  }
+
+  QImage img(reinterpret_cast<const uchar*>(bgr.data),
+             bgr.cols, bgr.rows,
+             static_cast<int>(bgr.step),
+             QImage::Format_BGR888);
+  return img.copy();
+}
+
+VideoView::DrawOverlay VideoView::BuildOverlayFromSegRes(const SegDetectorRes& seg) {
+  DrawOverlay ov;
+  ov.frame_idx = seg.frame_idx;
+  ov.time_ns = seg.time_ns;
+  ov.timing = seg.timing;
+
+  ov.dets.reserve(seg.yolo_objects.size());
+  for (const auto& d : seg.yolo_objects) {
+    DrawDet dd;
+    dd.class_id = d.class_id;
+    dd.score = d.score;
+    dd.box = QRectF(d.box.x, d.box.y, d.box.width, d.box.height);
+    dd.selected = false;
+    ov.dets.push_back(dd);
+  }
+
+  ov.has_selected = seg.has_select_object;
+  if (seg.has_select_object) {
+    const auto& sb = seg.select_object.box;
+    ov.selected_box = QRectF(sb.x, sb.y, sb.width, sb.height);
+
+    // Mark selected if it matches exactly one of dets (best-effort).
+    for (auto& dd : ov.dets) {
+      if (dd.class_id == seg.select_object.class_id &&
+          std::abs(dd.score - seg.select_object.score) < 1e-6f &&
+          std::abs(dd.box.x() - ov.selected_box.x()) < 1e-3 &&
+          std::abs(dd.box.y() - ov.selected_box.y()) < 1e-3 &&
+          std::abs(dd.box.width() - ov.selected_box.width()) < 1e-3 &&
+          std::abs(dd.box.height() - ov.selected_box.height()) < 1e-3) {
+        dd.selected = true;
+        break;
+      }
+    }
+  }
+
+  ov.good_pts.reserve(seg.good_pts_to_track.size());
+  for (const auto& p : seg.good_pts_to_track) {
+    ov.good_pts.emplace_back(p.x, p.y);
+  }
+
+  return ov;
+}
+
+QRectF VideoView::ComputeLetterboxRect(int img_w, int img_h) const {
+  if (img_w <= 0 || img_h <= 0) return QRectF();
+
+  const QRectF r = rect();
+  const double vw = r.width();
+  const double vh = r.height();
+
+  const double sx = vw / static_cast<double>(img_w);
+  const double sy = vh / static_cast<double>(img_h);
+  const double s = std::min(sx, sy);
+
+  const double dw = img_w * s;
+  const double dh = img_h * s;
+
+  const double x = (vw - dw) * 0.5;
+  const double y = (vh - dh) * 0.5;
+
+  return QRectF(x, y, dw, dh);
+}
+
+QPointF VideoView::MapImageToWidget(const QPointF& p_img, const QRectF& draw_rect,
+                                   int img_w, int img_h) const {
+  const double sx = draw_rect.width() / static_cast<double>(img_w);
+  const double sy = draw_rect.height() / static_cast<double>(img_h);
+  return QPointF(draw_rect.x() + p_img.x() * sx,
+                 draw_rect.y() + p_img.y() * sy);
+}
+
+QRectF VideoView::MapImageRectToWidget(const QRectF& r_img, const QRectF& draw_rect,
+                                       int img_w, int img_h) const {
+  const QPointF tl = MapImageToWidget(QPointF(r_img.x(), r_img.y()), draw_rect, img_w, img_h);
+  const QPointF br = MapImageToWidget(QPointF(r_img.x() + r_img.width(),
+                                             r_img.y() + r_img.height()), draw_rect, img_w, img_h);
+  return QRectF(tl, br).normalized();
+}
+
+void VideoView::PaintTitleAndOverlays(QPainter* painter, const QRectF& draw_rect) {
+  painter->save();
+
+  // Title bar
+  {
+    const int pad = 6;
+    QFont f = painter->font();
+    f.setPointSize(std::max(9, f.pointSize()));
+    f.setBold(true);
+    painter->setFont(f);
+
+    const QString t = title_;
+    QFontMetrics fm(f);
+    const int th = fm.height() + 2 * pad;
+
+    QRectF title_rect(0, 0, width(), th);
+    painter->fillRect(title_rect, QColor(0, 0, 0, 120));
+    painter->setPen(QColor(230, 230, 230));
+    painter->drawText(title_rect.adjusted(pad, 0, -pad, 0),
+                      Qt::AlignVCenter | Qt::AlignLeft, t);
+  }
+
+  // Overlay (center or top-left)
+  QString overlay_text;
+  bool overlay_center = true;
+  QColor overlay_color;
+  bool has_overlay = false;
+
+  QString warn_text;
+  QColor warn_color;
+  bool has_warn = false;
+
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    overlay_text = overlay_text_;
+    overlay_center = overlay_center_;
+    overlay_color = overlay_color_;
+    has_overlay = has_overlay_;
+
+    warn_text = warn_overlay_text_;
+    warn_color = warn_overlay_color_;
+    has_warn = has_warn_overlay_;
+  }
+
+  if (has_overlay) {
+    painter->setPen(overlay_color);
+    painter->setBrush(Qt::NoBrush);
+
+    QFont f = painter->font();
+    f.setBold(true);
+    painter->setFont(f);
+
+    QRectF r = draw_rect;
+    if (!overlay_center) {
+      r = QRectF(draw_rect.x() + 10, draw_rect.y() + 10,
+                 draw_rect.width() - 20, draw_rect.height() - 20);
+      painter->fillRect(QRectF(r.x() - 6, r.y() - 6, 420, 32), overlay_bg_);
+      painter->drawText(r, Qt::AlignLeft | Qt::AlignTop, overlay_text);
+    } else {
+      painter->fillRect(QRectF(draw_rect.center().x() - 260, draw_rect.center().y() - 20,
+                               520, 40), overlay_bg_);
+      painter->drawText(draw_rect, Qt::AlignCenter, overlay_text);
+    }
+  }
+
+  if (has_warn) {
+    painter->setPen(warn_color);
+    QFont f = painter->font();
+    f.setBold(true);
+    painter->setFont(f);
+
+    QRectF r(draw_rect.x() + 10, draw_rect.y() + draw_rect.height() - 50,
+             draw_rect.width() - 20, 40);
+    painter->fillRect(r.adjusted(-6, -4, 6, 4), QColor(0, 0, 0, 160));
+    painter->drawText(r, Qt::AlignLeft | Qt::AlignVCenter, warn_text);
+  }
+
+  painter->restore();
+}
+
+void VideoView::PaintTrackingOverlay(QPainter* painter, const QRectF& draw_rect,
+                                     int img_w, int img_h, const DrawOverlay& ov) {
+  painter->save();
+
+  // bboxes
+  QPen pen_all(QColor(0, 220, 255), 2);
+  QPen pen_sel(QColor(0, 255, 0), 3);
+
+  painter->setBrush(Qt::NoBrush);
+
+  for (const auto& d : ov.dets) {
+    QRectF wr = MapImageRectToWidget(d.box, draw_rect, img_w, img_h);
+    painter->setPen(d.selected ? pen_sel : pen_all);
+    painter->drawRect(wr);
+
+    // label
+    QString label = QString("id=%1  s=%2")
+                        .arg(d.class_id)
+                        .arg(QString::number(d.score, 'f', 2));
+    QRectF lr(wr.x(), wr.y() - 18, 160, 18);
+    painter->fillRect(lr, QColor(0, 0, 0, 140));
+    painter->setPen(QColor(240, 240, 240));
+    painter->drawText(lr.adjusted(4, 0, -4, 0), Qt::AlignVCenter | Qt::AlignLeft, label);
+  }
+
+  // selected box highlight (in case it didn't match a det)
+  if (ov.has_selected) {
+    QRectF wr = MapImageRectToWidget(ov.selected_box, draw_rect, img_w, img_h);
+    painter->setPen(pen_sel);
+    painter->drawRect(wr);
+  }
+
+  // good points
+  painter->setPen(Qt::NoPen);
+  painter->setBrush(QColor(255, 220, 0));
+  const double r = 2.5;
+  for (const auto& p : ov.good_pts) {
+    QPointF wp = MapImageToWidget(p, draw_rect, img_w, img_h);
+    painter->drawEllipse(wp, r, r);
+  }
+
+  // timing text
+  {
+    painter->setPen(QColor(230, 230, 230));
+    painter->setBrush(Qt::NoBrush);
+
+    QString t = QString("frame=%1  yolo=%2ms  select=%3ms  gftt=%4ms  total=%5ms")
+                    .arg(ov.frame_idx)
+                    .arg(QString::number(ov.timing.yolo_ms, 'f', 2))
+                    .arg(QString::number(ov.timing.select_object_ms, 'f', 2))
+                    .arg(QString::number(ov.timing.gftt_ms, 'f', 2))
+                    .arg(QString::number(ov.timing.total_ms, 'f', 2));
+
+    QRectF tr(draw_rect.x() + 10, draw_rect.y() + 10, draw_rect.width() - 20, 24);
+    painter->fillRect(tr.adjusted(-6, -3, 6, 3), QColor(0, 0, 0, 140));
+    painter->drawText(tr, Qt::AlignLeft | Qt::AlignVCenter, t);
+  }
+
+  painter->restore();
+}
+
+void VideoView::PaintStabilizedView(QPainter* painter, const QRectF& draw_rect,
+                                    const QImage& img, const Eigen::Vector2d& shift_px) {
+  painter->save();
+
+  // Paint black canvas inside draw_rect
+  painter->fillRect(draw_rect, QColor(0, 0, 0));
+
+  // Draw the image translated within draw_rect.
+  // shift_px is in "image pixel" coords, so convert to widget pixels by scale.
+  const int img_w = img.width();
+  const int img_h = img.height();
+  if (img_w <= 0 || img_h <= 0) {
+    painter->restore();
+    return;
+  }
+
+  const double sx = draw_rect.width() / static_cast<double>(img_w);
+  const double sy = draw_rect.height() / static_cast<double>(img_h);
+
+  const double tx = shift_px.x() * sx;
+  const double ty = shift_px.y() * sy;
+
+  // Translate painter, then draw the image as usual to draw_rect.
+  painter->save();
+  painter->setClipRect(draw_rect);
+  painter->translate(tx, ty);
+  painter->drawImage(draw_rect, img);  // letterbox already represented by draw_rect
+  painter->restore();
+
+  // Draw shift text
+  painter->setPen(QColor(230, 230, 230));
+  QString s = QString("shift_px = ( %1 , %2 )")
+                  .arg(QString::number(shift_px.x(), 'f', 2))
+                  .arg(QString::number(shift_px.y(), 'f', 2));
+  QRectF tr(draw_rect.x() + 10, draw_rect.y() + 10, draw_rect.width() - 20, 24);
+  painter->fillRect(tr.adjusted(-6, -3, 6, 3), QColor(0, 0, 0, 140));
+  painter->drawText(tr, Qt::AlignLeft | Qt::AlignVCenter, s);
+
+  painter->restore();
 }
 
 void VideoView::paintEvent(QPaintEvent* /*event*/) {
   QPainter painter(this);
-  painter.fillRect(rect(), QColor(32, 32, 32));
+  painter.setRenderHint(QPainter::Antialiasing, true);
+  painter.fillRect(rect(), QColor(20, 20, 20));
 
-  // 标题
-  painter.setPen(QColor(220, 220, 220));
-  QFont font = painter.font();
-  font.setBold(true);
-  painter.setFont(font);
-  painter.drawText(10, 20, title_);
+  // Snapshot state under lock (avoid holding lock while drawing).
+  RenderMode mode = RenderMode::kNone;
+  QImage img;
+  bool has_frame = false;
+  std::optional<DrawOverlay> ov;
+  Eigen::Vector2d global_offset = Eigen::Vector2d::Zero();
+  FrameStableResult stable_res;
+  bool has_stable = false;
 
-  // 内容区域
-  QRect content_rect = rect().adjusted(5, 25, -5, -5);
-
-  last_draw_rect_ = QRectF();
-
-  if (has_frame_ && !pixmap_.isNull() && !content_rect.isEmpty()) {
-    QPixmap fit = pixmap_.scaled(content_rect.size(),
-                                 Qt::KeepAspectRatio,
-                                 Qt::SmoothTransformation);
-
-    int x = content_rect.x() + (content_rect.width() - fit.width()) / 2;
-    int y = content_rect.y() + (content_rect.height() - fit.height()) / 2;
-
-    painter.save();
-    painter.setClipRect(content_rect);
-    painter.drawPixmap(x, y, fit);
-    painter.restore();
-
-    last_draw_rect_ = QRectF(x, y, fit.width(), fit.height());
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    mode = mode_;
+    img = img_;
+    has_frame = has_frame_;
+    ov = overlay_;
+    global_offset = global_offset_px_;
+    stable_res = stable_res_;
+    has_stable = has_stable_;
   }
 
-  // 目标框（如有）
-  if (has_target_rect_ && !last_draw_rect_.isNull()) {
-    const QRectF& r = target_rect_norm_;
-    double rx = r.x();
-    double ry = r.y();
-    double rw = r.width();
-    double rh = r.height();
-
-    double x = last_draw_rect_.x() + rx * last_draw_rect_.width();
-    double y = last_draw_rect_.y() + ry * last_draw_rect_.height();
-    double w = rw * last_draw_rect_.width();
-    double h = rh * last_draw_rect_.height();
-
-    painter.setPen(QColor(0, 255, 0));
-    painter.drawRect(QRectF(x, y, w, h));
+  if (!has_frame || img.isNull()) {
+    // No frame: show title and overlays only.
+    last_draw_rect_ = QRectF();
+    PaintTitleAndOverlays(&painter, QRectF(0, 0, width(), height()));
+    return;
   }
 
-  // overlay 文本
-  if (has_overlay_ && !overlay_text_.isEmpty()) {
-    QFont ofont("Microsoft YaHei", 11);
-    painter.setFont(ofont);
-    QFontMetrics metrics(ofont);
+  const int img_w = img.width();
+  const int img_h = img.height();
 
-    int text_width = metrics.horizontalAdvance(overlay_text_);
-    int text_height = metrics.height();
+  QRectF draw_rect = ComputeLetterboxRect(img_w, img_h);
+  last_draw_rect_ = draw_rect;
 
-    double tx = content_rect.center().x() - text_width / 2.0;
-    double ty = overlay_center_
-                    ? content_rect.center().y() - text_height / 2.0
-                    : content_rect.y() + content_rect.height() * 0.1;
+  // Base image
+  if (mode == RenderMode::kPreviewRight && has_stable) {
+    // Right preview: stabilized render by translation onto canvas.
+    const Eigen::Vector2d shift = global_offset + Eigen::Vector2d(stable_res.delta_x, stable_res.delta_y);
+    PaintStabilizedView(&painter, draw_rect, img, shift);
+  } else {
+    // Tracking / Left preview: draw raw frame fit to view.
+    painter.drawImage(draw_rect, img);
 
-    QRectF bg_rect(tx - 10,
-                   ty - text_height,
-                   text_width + 20,
-                   text_height + 40);
-
-    painter.fillRect(bg_rect, overlay_bg_);
-    painter.setPen(overlay_color_);
-    painter.drawText(bg_rect,
-                     Qt::AlignCenter | Qt::AlignVCenter,
-                     overlay_text_);
+    if (ov.has_value()) {
+      PaintTrackingOverlay(&painter, draw_rect, img_w, img_h, ov.value());
+    }
   }
 
-  // 警告 overlay
-  if (has_warn_overlay_ && !warn_overlay_text_.isEmpty()) {
-    QFont wfont("Microsoft YaHei", 11);
-    painter.setFont(wfont);
-    QFontMetrics metrics(wfont);
-
-    int text_width = metrics.horizontalAdvance(warn_overlay_text_);
-    int text_height = metrics.height();
-
-    double tx = content_rect.center().x() - text_width / 2.0;
-    double ty = content_rect.center().y() - text_height / 2.0;
-
-    QRectF bg_rect(tx - 10,
-                   ty - text_height,
-                   text_width + 20,
-                   text_height + 40);
-
-    painter.fillRect(bg_rect, overlay_bg_);
-    painter.setPen(warn_overlay_color_);
-    painter.drawText(bg_rect,
-                     Qt::AlignCenter | Qt::AlignVCenter,
-                     warn_overlay_text_);
-  }
-
-  // 中间的大播放按钮
-  if (show_play_icon_ && !content_rect.isEmpty()) {
-    painter.setRenderHint(QPainter::Antialiasing, true);
-
-    double size =
-        std::min(content_rect.width(), content_rect.height()) * 0.10;
-    double radius = size / 2.0;
-    QPointF center = content_rect.center();
-
-    // 阴影
-    QRectF shadow_rect(center.x() - radius - 3,
-                       center.y() - radius - 3,
-                       size + 6,
-                       size + 6);
-    painter.setBrush(QColor(0, 0, 0, 120));
-    painter.setPen(Qt::NoPen);
-    painter.drawEllipse(shadow_rect);
-
-    // 渐变圆
-    QRectF circle_rect(center.x() - radius,
-                       center.y() - radius,
-                       size,
-                       size);
-    QRadialGradient grad(circle_rect.center(), radius);
-    grad.setColorAt(0.0, QColor(255, 255, 255, 40));
-    grad.setColorAt(1.0, QColor(0, 0, 0, 190));
-    painter.setBrush(grad);
-    painter.setPen(QPen(QColor(255, 255, 255, 220), 1.6));
-    painter.drawEllipse(circle_rect);
-
-    // ▶ 三角形
-    double tri_r = radius * 0.58;
-    QPointF p1(center.x() - tri_r * 0.35, center.y() - tri_r);
-    QPointF p2(center.x() - tri_r * 0.35, center.y() + tri_r);
-    QPointF p3(center.x() + tri_r, center.y());
-    QPolygonF triangle;
-    triangle << p1 << p2 << p3;
-
-    painter.setBrush(QColor(255, 255, 255, 235));
-    painter.setPen(Qt::NoPen);
-    painter.drawPolygon(triangle);
-  }
+  // Title + overlays always on top
+  PaintTitleAndOverlays(&painter, draw_rect);
 }
 
 void VideoView::mousePressEvent(QMouseEvent* event) {
-  if (event->button() == Qt::LeftButton && !last_draw_rect_.isNull()) {
-    QPointF pos = event->position();
-    if (!last_draw_rect_.contains(pos)) {
-      QWidget::mousePressEvent(event);
-      return;
-    }
+  // Optional: Click-to-select behavior can be expanded later.
+  // Currently: emit normalized point rect (tiny) so upstream can decide.
+  if (event == nullptr) return;
 
-    double x_norm =
-        (pos.x() - last_draw_rect_.x()) / last_draw_rect_.width();
-    double y_norm =
-        (pos.y() - last_draw_rect_.y()) / last_draw_rect_.height();
-    x_norm = std::clamp(x_norm, 0.0, 1.0);
-    y_norm = std::clamp(y_norm, 0.0, 1.0);
-
-    emit clicked(x_norm, y_norm);
-    event->accept();
-    return;
+  QRectF draw_rect;
+  QImage img;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    draw_rect = last_draw_rect_;
+    img = img_;
   }
-  QWidget::mousePressEvent(event);
+  if (img.isNull() || draw_rect.isEmpty()) return;
+
+  const QPointF p = event->pos();
+  if (!draw_rect.contains(p)) return;
+
+  // Convert widget point -> image normalized.
+  const double nx = (p.x() - draw_rect.x()) / draw_rect.width();
+  const double ny = (p.y() - draw_rect.y()) / draw_rect.height();
+
+  const double clx = Clamp(nx, 0.0, 1.0);
+  const double cly = Clamp(ny, 0.0, 1.0);
+
+  QRectF tiny(clx, cly, 0.001, 0.001);
+  emit TargetRectSelected(tiny);
 }
 
 }  // namespace airsteady

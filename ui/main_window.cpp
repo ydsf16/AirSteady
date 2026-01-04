@@ -143,12 +143,6 @@ void MainWindow::buildUi() {
           this, &MainWindow::onSmoothChanged);
   connect(control_panel_, &ControlPanel::cropKeepRatioChanged,
           this, &MainWindow::onCropKeeRatioChanged);
-  
-  // 视频点击相关的，用于停止和启动播放。
-  connect(raw_view_, &VideoView::clicked,
-          this, &MainWindow::onVideoViewClicked);
-  connect(steady_view_, &VideoView::clicked,
-          this, &MainWindow::onVideoViewClicked);
 }
 
 void MainWindow::onOpenClicked() {
@@ -286,8 +280,7 @@ QPixmap MainWindow::matToQPixmap(const cv::Mat& mat_bgr) {
 }
 
 void MainWindow::OnReceiveTrackingResult(const FrameTrackingResultPreview& track_preview) {
-  auto qpixel_img = matToQPixmap(track_preview.proxy_bgr);
-  raw_view_->setFramePixmap(qpixel_img);
+  raw_view_->SetTrackFrame(track_preview);
 
 }
 }  // namespace airsteady

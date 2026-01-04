@@ -15,7 +15,7 @@ namespace airsteady {
 struct StableParams {
   std::string track_type = "airplane";
 
-  double smooth_ratio = 0.5;  // 0.0 - 1.0
+  double smooth_ratio = 1.0;  // 0.0 - 1.0
 
   bool enable_crop = true;
   double crop_keep_ratio = 1.0;
@@ -137,6 +137,8 @@ struct FrameTrackingResult {
   // Global center.
   bool global_center_valid = false;
   Eigen::Vector2d global_center = Eigen::Vector2d::Zero();
+
+  SegDetectorRes seg_detect_res;
 };
 
 struct FrameTrackingResultPreview {

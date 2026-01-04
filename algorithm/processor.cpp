@@ -28,6 +28,12 @@ Processor::Processor(const Config& config) : config_(config) {
   StabilizerConfig stabilizer_cfg;
   stabilizer_cfg.debug_output_dir = video_work_folder;
   stabilizer_ = std::make_shared<Stabilizer>(stabilizer_cfg);
+
+  // 预览器
+  previewer_ = std::make_shared<Previewer>(proxy_path); 
+
+  // Idle
+  SetStatus(Status::kIdle);
 }
 
 Processor::Processor(std::string work_folder) : work_folder_(std::move(work_folder)) {}
@@ -61,6 +67,10 @@ bool Processor::GetVideoInfo(VideoInfo* video_info) const {
 
 bool Processor::StartTracking(std::string* err_info) {
   bool ret = tracker_->StartTracking();
+
+  if (ret) {
+    SetStatus(Status::kTracking);
+  }
   return ret;
 }
 
@@ -95,24 +105,20 @@ bool Processor::UpdateParamAndRestable(const StableParams& stable_params, std::s
   return StartStabilize(err_info);
 }
 
-bool Processor::PreparePreview(std::string* err_info) {
-  (void)err_info;
-  return false;
+bool Processor::StartPreview() {
+  return previewer_->StartPreview();
 }
 
-bool Processor::StartPreview(std::string* err_info) {
-  (void)err_info;
-  return false;
+bool Processor::HoldPreview() {
+  return previewer_->HoldPreview();
 }
 
-void Processor::StopPreview() {}
-
-void Processor::SeekPreview(double time_sec) {
-  (void)time_sec;
+void Processor::SeekPreview(int frame_idx) {
+  return previewer_->SeekPreview(frame_idx);
 }
 
 void Processor::AddPreviewCallback(PreviewCallback cb) {
-  preview_cbs_.push_back(std::move(cb));
+  previewer_->AddPreviewCallback(cb);
 }
 
 bool Processor::StartExport(std::string* err) {
@@ -136,9 +142,22 @@ bool Processor::Load(std::string& work_folder) {
 }
 
 void Processor::OnTrackingFinished() {
+  SetStatus(Status::kStabilizing);
+
   LOG(WARNING) << "TrackEnd Start stablize!!!";
   std::string err;
   StartStabilize(&err);
+}
+
+void Processor::OnStabilizerFinished() {
+  LOG(INFO) << "Stabilizer finished, insert result to previewer.";
+  previewer_->SetTrackResults(tracker_->GetTrackingResults(),
+              stabilizer_->GetStabilizedResults());
+  
+  // Show the first frame.
+  previewer_->SeekAndPreviewOnce(0);
+
+  SetStatus(Status::kStabilized);
 }
 
 }  // namespace airsteady

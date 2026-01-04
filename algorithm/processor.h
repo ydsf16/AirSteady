@@ -12,6 +12,7 @@
 #include "algorithm/video_preprocessor.h"
 #include "algorithm/tracker.h"
 #include "algorithm/stabilizer.h"
+#include "algorithm/previewer.h"
 
 namespace airsteady {
 
@@ -81,15 +82,10 @@ class Processor {
   bool UpdateParamAndRestable(const StableParams& stable_params, std::string* err_info);
 
   // ---------------- Preview ----------------
-  // Prepare preview, e.g. open proxy decoder, seek to first frame, etc.
-  bool PreparePreview(std::string* err_info);
   // Start preview playback asynchronously.
-  bool StartPreview(std::string* err_info);
-  // Stop preview playback and release related resources.
-  void StopPreview();
-  // Seek to a specific timestamp (in seconds).
-  void SeekPreview(double time_sec);
-  // Register preview callback; usually called once after Processor creation.
+  bool StartPreview();
+  bool HoldPreview();
+  void SeekPreview(int frame_idx);
   void AddPreviewCallback(PreviewCallback cb);
 
   // ---------------- Export ----------------
@@ -102,6 +98,7 @@ class Processor {
 
 private:
   void OnTrackingFinished();
+  void OnStabilizerFinished();
 
  private:
   Config config_;
@@ -129,6 +126,7 @@ private:
   std::shared_ptr<VideoPreprocessor> video_preprocessor_;
   std::shared_ptr<Tracker> tracker_;
   std::shared_ptr<Stabilizer> stabilizer_;
+  std::shared_ptr<Previewer> previewer_;
 };
 
 }  // namespace airsteady

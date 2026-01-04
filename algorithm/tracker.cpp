@@ -234,7 +234,7 @@ void Tracker::Run() {
 
         FrameTrackingResult track_res;
         track_res.frame_idx = frame_idx;
-        track_res.time_ns = static_cast<std::int64_t>(curr_frame->time_ns);
+        track_res.time_ns = curr_frame->time_ns;
 
         std::vector<cv::Point2f> curr_pts;
 

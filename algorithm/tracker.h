@@ -44,8 +44,8 @@ class Tracker {
     double max_klt_error = 10.0;
 
     // For seg detector.
-    size_t yolo_detect_every_n_frames = 10;
-    std::size_t max_num_good_features = 100;
+    int yolo_detect_every_n_frames = 10;
+    int max_num_good_features = 100;
     std::string select_obj_name = "airplane";
   };
 
