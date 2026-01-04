@@ -13,9 +13,9 @@
 namespace airsteady {
 
 struct StableParams {
-  std::string track_type = "air_plane";
+  std::string track_type = "airplane";
 
-  double smooth_ratio = 1.0;  // 0.0 - 1.0
+  double smooth_ratio = 0.5;  // 0.0 - 1.0
 
   bool enable_crop = true;
   double crop_keep_ratio = 1.0;
@@ -47,11 +47,16 @@ struct VideoInfo {
   int width = 0;
   int height = 0;
   double bitrate = 0.0;
+  double fps = 30.0;
 
   double total_time_sec = 0.0;
   int num_frames = 0;
 
   std::string codec;
+
+  // Proxy related.
+  int proxy_width  = 0;
+  int proxy_height = 0;
 };
 
 inline std::ostream& operator<<(std::ostream& os, const VideoInfo& info) {
@@ -80,11 +85,11 @@ struct BBox {
 
 struct FrameStableResult {
   int frame_idx = 0;
-  std::int64_t time_ns = 0;
+  int time_ns = 0;
 
-  double delta_u = 0.0;
-  double delta_v = 0.0;
-  double delta_yaw = 0.0;
+  // 相对于原始图像，图像需要往这两个方向偏移的量
+  double delta_x = 0.0;
+  double delta_y = 0.0;
 };
 
 struct PreFrame {

@@ -11,6 +11,7 @@
 #include "common/types.h"
 #include "algorithm/video_preprocessor.h"
 #include "algorithm/tracker.h"
+#include "algorithm/stabilizer.h"
 
 namespace airsteady {
 
@@ -99,6 +100,9 @@ class Processor {
   bool Save(const std::string& work_folder);
   bool Load(std::string& work_folder);
 
+private:
+  void OnTrackingFinished();
+
  private:
   Config config_;
 
@@ -124,6 +128,7 @@ class Processor {
   // Subprocessor.s
   std::shared_ptr<VideoPreprocessor> video_preprocessor_;
   std::shared_ptr<Tracker> tracker_;
+  std::shared_ptr<Stabilizer> stabilizer_;
 };
 
 }  // namespace airsteady

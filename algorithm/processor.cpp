@@ -10,13 +10,24 @@ namespace airsteady {
 Processor::Processor(const Config& config) : config_(config) {
   std::string video_name;
   GetVideoName(config_.video_path, &video_name);
-  const std::string proxy_path = config_.system_params.work_folder + "/" + video_name + "_proxy.mp4";
+
+  const std::string video_work_folder = config_.system_params.work_folder + "/" + video_name;
+  CreateFolder(video_work_folder);
+
+  const std::string proxy_path = video_work_folder + "/proxy.mp4";
   video_preprocessor_ = std::make_shared<VideoPreprocessor>(
     config_.video_path,
     proxy_path,
     config_.system_params.max_porxy_resolution
   );
+
   tracker_ = std::make_shared<Tracker>(video_preprocessor_.get());
+  // Add finished callback.
+  tracker_->AddTrackFinishedCallback(std::bind(&Processor::OnTrackingFinished, this));
+
+  StabilizerConfig stabilizer_cfg;
+  stabilizer_cfg.debug_output_dir = video_work_folder;
+  stabilizer_ = std::make_shared<Stabilizer>(stabilizer_cfg);
 }
 
 Processor::Processor(std::string work_folder) : work_folder_(std::move(work_folder)) {}
@@ -65,7 +76,10 @@ void Processor::AddTrackFinishedCallback(TrackFinishedCallback cb) {
 
 bool Processor::StartStabilize(std::string* err_info) {
   (void)err_info;
-  return false;
+  stabilizer_->StartStabilize(tracker_->GetTrackingResults(), 
+                              video_info_,
+                              config_.stable_params.smooth_ratio);
+  return true;
 }
 
 void Processor::AddStableFinishedCallback(StableFinishedCallback cb) {
@@ -75,7 +89,10 @@ void Processor::AddStableFinishedCallback(StableFinishedCallback cb) {
 bool Processor::UpdateParamAndRestable(const StableParams& stable_params, std::string* err_info) {
   (void)stable_params;
   (void)err_info;
-  return false;
+
+  config_.stable_params = stable_params;
+
+  return StartStabilize(err_info);
 }
 
 bool Processor::PreparePreview(std::string* err_info) {
@@ -116,6 +133,12 @@ bool Processor::Save(const std::string& work_folder) {
 bool Processor::Load(std::string& work_folder) {
   (void)work_folder;
   return false;
+}
+
+void Processor::OnTrackingFinished() {
+  LOG(WARNING) << "TrackEnd Start stablize!!!";
+  std::string err;
+  StartStabilize(&err);
 }
 
 }  // namespace airsteady

@@ -438,8 +438,8 @@ bool VideoPreprocessor::TryOpenVideo(std::string* err) {
 
   // Compute fps for writer (best-effort).
   double fps = 0.0;
-  if (info_.total_time_sec > 0.0 && info_.num_frames > 0) {
-    fps = static_cast<double>(info_.num_frames) / info_.total_time_sec;
+  if (info_.total_time_sec > 0.0 && info_.num_frames > 1) {
+    fps = static_cast<double>(info_.num_frames - 1) / info_.total_time_sec;
   } else if (video_st_) {
     AVRational fr = video_st_->avg_frame_rate.num && video_st_->avg_frame_rate.den
                         ? video_st_->avg_frame_rate
@@ -448,6 +448,10 @@ bool VideoPreprocessor::TryOpenVideo(std::string* err) {
   }
   if (fps <= 0.0) fps = 30.0;
   fps_hint_ = fps;
+
+  info_.fps = fps_hint_;
+  info_.proxy_width = proxy_w_;
+  info_.proxy_height = proxy_h_;
 
   LOG(INFO) << "[VideoPreprocessor] Proxy fps=" << fps_hint_;
 
