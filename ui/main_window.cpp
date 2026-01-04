@@ -85,8 +85,6 @@ void MainWindow::buildUi() {
   steady_view_->setMinimumWidth(360);
 
   // 底部播放控制
-  prev_btn_ = new QToolButton(this);
-  prev_btn_->setText(QStringLiteral("◀"));
   play_btn_ = new QToolButton(this);
   play_btn_->setText(QStringLiteral("▶"));
 
@@ -97,7 +95,6 @@ void MainWindow::buildUi() {
 
   auto* bottom_bar = new QWidget(this);
   auto* bottom_layout = new QHBoxLayout(bottom_bar);
-  bottom_layout->addWidget(prev_btn_);
   bottom_layout->addWidget(play_btn_);
   bottom_layout->addWidget(timeline_slider_, 1);
   bottom_layout->addWidget(time_label_);
@@ -133,8 +130,6 @@ void MainWindow::buildUi() {
 
   connect(play_btn_, &QToolButton::clicked,
           this, &MainWindow::onPlayPauseClicked);
-  connect(prev_btn_, &QToolButton::clicked,
-          this, &MainWindow::onPrevClicked);
   connect(timeline_slider_, &QSlider::sliderReleased,
           this, &MainWindow::onTimelineReleased);
   
@@ -196,6 +191,11 @@ void MainWindow::onOpenClicked() {
       OnReceiveTrackingResult(res);
     });
 
+  video_processor_->AddPreviewCallback(
+    [this](const FramePreview& res) {
+      onReceivePreviewResult(res);
+    });
+
   // Start tracking!!!
   video_processor_->StartTracking(&err);
 }
@@ -209,14 +209,43 @@ void MainWindow::onExportClicked() {
 }
 
 void MainWindow::onPlayPauseClicked() {
-}
+  LOG(INFO) << "onPlayPauseClicked: "
+            << ", " << (int)(video_processor_->status());
+  if (video_processor_->status() != Processor::Status::kStabilized) {
+    return;
+  }
 
-void MainWindow::onPrevClicked() {
-  
+  if (preview_is_run_ == false) {
+    LOG(INFO) <<  "Start preview";
+    video_processor_->StartPreview();
+    preview_is_run_ = true;
+    play_btn_->setText(QStringLiteral("||"));
+  } else {
+    video_processor_->HoldPreview();
+    LOG(INFO) <<  "Stop preview";
+    preview_is_run_ = false;
+    play_btn_->setText(QStringLiteral("▶"));
+  }
 }
 
 void MainWindow::onTimelineReleased() {
-  
+  LOG(INFO) << "onTimelineReleased 1: ";
+  if (video_processor_->status() != Processor::Status::kStabilized) {
+    return;
+  }
+  LOG(INFO) << "onTimelineReleased 2: ";
+
+  if (preview_is_run_ == true) {
+    return;
+  }
+
+  LOG(INFO) << "onTimelineReleased 3: ";
+
+  int frame_idx = timeline_slider_->value();
+  LOG(INFO) << "Seek frame: " << frame_idx;
+
+  video_processor_->SeekAndPreviewOnce(frame_idx);
+  LOG(INFO) << "Seek frame2: " << frame_idx;
 }
 
 void MainWindow::onReadmeClicked() {
@@ -258,29 +287,99 @@ void MainWindow::OnTrackingResult(const FrameTrackingResult& res) {
 }
 
 void MainWindow::OnTrackFinished() {
-
+  LOG(INFO) << "Main window receive ontrack finished.";
 }
 
 void MainWindow::OnStablePlaneFinished() {
 
 }
 
-QPixmap MainWindow::matToQPixmap(const cv::Mat& mat_bgr) {
-  if (mat_bgr.empty()) {
-    return QPixmap();
-  }
-  cv::Mat mat_rgb;
-  cv::cvtColor(mat_bgr, mat_rgb, cv::COLOR_BGR2RGB);
-  QImage img(mat_rgb.data,
-             mat_rgb.cols,
-             mat_rgb.rows,
-             static_cast<int>(mat_rgb.step),
-             QImage::Format_RGB888);
-  return QPixmap::fromImage(img.copy());
-}
-
 void MainWindow::OnReceiveTrackingResult(const FrameTrackingResultPreview& track_preview) {
+  // Copy only what we need (Mat lifetime: VideoView will deep copy; here we pass by value in lambda).
+  const FrameTrackingResultPreview preview_copy = track_preview;
   raw_view_->SetTrackFrame(track_preview);
 
+  QMetaObject::invokeMethod(this, [this, preview_copy]() {
+    if (!video_processor_) {
+      LOG(WARNING) << "No video_processor_!";
+      return;
+    }
+    if (!raw_view_) {
+      LOG(WARNING) << "No raw_view_!";
+      return;
+    }
+    if (video_processor_->status() != Processor::Status::kTracking) {
+      return;
+    }
+
+    // raw_view_->SetTrackFrame(preview_copy);
+
+    const VideoInfo video_info = video_processor_->GetVideoInfo();
+    const int total = std::max(0, static_cast<int>(video_info.num_frames));
+    const int idx = preview_copy.seg_detect_res.frame_idx;
+
+    if (timeline_slider_) {
+      const int max_idx = std::max(0, total - 1);
+      timeline_slider_->setRange(0, max_idx);
+      timeline_slider_->setValue(std::clamp(idx, 0, max_idx));
+    }
+
+    if (time_label_) {
+      double ratio = 0.0;
+      if (total > 0) ratio = static_cast<double>(idx) / static_cast<double>(total);
+
+      std::ostringstream ss;
+      ss << "frame " << idx << "/" << std::max(0, total - 1)
+         << " (" << std::fixed << std::setprecision(1) << (ratio * 100.0) << "%)";
+      time_label_->setText(QString::fromStdString(ss.str()));
+    }
+  }, Qt::QueuedConnection);
 }
+
+static int SafeClampFrameIdx(int idx, int total) {
+  if (total <= 0) return 0;
+  const int max_idx = std::max(0, total - 1);
+  return std::clamp(idx, 0, max_idx);
+}
+
+static QString FormatFrameProgress(int idx, int total) {
+  const int max_idx = std::max(0, total - 1);
+  double ratio = 0.0;
+  if (total > 0) ratio = static_cast<double>(idx) / static_cast<double>(total);
+
+  std::ostringstream ss;
+  ss << "frame " << idx << "/" << max_idx << " ("
+     << std::fixed << std::setprecision(1) << (ratio * 100.0) << "%)";
+  return QString::fromStdString(ss.str());
+}
+
+void MainWindow::onReceivePreviewResult(const FramePreview& frame_preview) {
+  LOG(INFO) << "Receive frame_preview: " << frame_preview.frame_idx;
+
+  QPointer<MainWindow> self(this);
+  FramePreview preview_copy = frame_preview;  // 若包含 Mat 且复用缓冲，同理可 clone
+
+  QMetaObject::invokeMethod(
+      this,
+      [self, preview = std::move(preview_copy)]() mutable {
+        if (!self) return;
+        if (!self->video_processor_) return;
+
+        if (self->raw_view_) {
+          LOG(INFO) << "Set view frame to left: " << preview.frame_idx << preview.proxy_bgr.size();
+          self->raw_view_->SetPreviewFrame(preview, Eigen::Vector2d::Zero(), true);
+          
+          LOG(INFO) << "raw_view visible=" << self->raw_view_->isVisible()
+            << " size=" << self->raw_view_->width() << "x" << self->raw_view_->height();
+
+          // cv::imshow("x", preview.proxy_bgr);
+          // cv::waitKey(1);
+        }
+        if (self->steady_view_) {
+          self->steady_view_->SetPreviewFrame(preview, Eigen::Vector2d::Zero(), false);
+        }
+      },
+      Qt::QueuedConnection);
+}
+
 }  // namespace airsteady

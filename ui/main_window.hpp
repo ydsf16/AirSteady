@@ -36,7 +36,6 @@ class MainWindow : public QMainWindow {
   void onOpenClicked();
   void onExportClicked();
   void onPlayPauseClicked();
-  void onPrevClicked();
   void onTimelineReleased();
   void onReadmeClicked();
   void onFeedbackClicked();
@@ -58,10 +57,8 @@ class MainWindow : public QMainWindow {
  private:
   void buildUi();
 
-  // BGR Mat -> QPixmap
-  QPixmap matToQPixmap(const cv::Mat& mat_bgr);
-
   void OnReceiveTrackingResult(const FrameTrackingResultPreview& track_preview);
+  void onReceivePreviewResult(const FramePreview& frame_preview);
 
  private:
   // 顶部
@@ -78,7 +75,6 @@ class MainWindow : public QMainWindow {
   ControlPanel* control_panel_ = nullptr;
 
   // 底部播放控制
-  QToolButton* prev_btn_ = nullptr;
   QToolButton* play_btn_ = nullptr;
   QSlider* timeline_slider_ = nullptr;
   QLabel* time_label_ = nullptr;
@@ -88,6 +84,8 @@ class MainWindow : public QMainWindow {
   QProgressBar* export_progress_ = nullptr;
 
   std::shared_ptr<Processor> video_processor_;
+
+  bool preview_is_run_ = false;
 };
 
 }  // namespace airsteady

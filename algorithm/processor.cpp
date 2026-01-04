@@ -28,6 +28,7 @@ Processor::Processor(const Config& config) : config_(config) {
   StabilizerConfig stabilizer_cfg;
   stabilizer_cfg.debug_output_dir = video_work_folder;
   stabilizer_ = std::make_shared<Stabilizer>(stabilizer_cfg);
+  stabilizer_->AddFinishedCallback(std::bind(&Processor::OnStabilizerFinished, this));
 
   // 预览器
   previewer_ = std::make_shared<Previewer>(proxy_path); 
@@ -56,13 +57,8 @@ void Processor::SetStatus(const Status& status) {
   status_.store(status, std::memory_order_release);
 }
 
-bool Processor::GetVideoInfo(VideoInfo* video_info) const {
-  if (video_info == nullptr) {
-    return false;
-  }
-  *video_info = video_info_;
-
-  return true;
+VideoInfo Processor::GetVideoInfo() const {
+  return video_info_;
 }
 
 bool Processor::StartTracking(std::string* err_info) {
@@ -117,6 +113,10 @@ void Processor::SeekPreview(int frame_idx) {
   return previewer_->SeekPreview(frame_idx);
 }
 
+void Processor::SeekAndPreviewOnce(int frame_idx) {
+  return previewer_->SeekAndPreviewOnce(frame_idx);
+}
+
 void Processor::AddPreviewCallback(PreviewCallback cb) {
   previewer_->AddPreviewCallback(cb);
 }
@@ -153,6 +153,7 @@ void Processor::OnStabilizerFinished() {
   LOG(INFO) << "Stabilizer finished, insert result to previewer.";
   previewer_->SetTrackResults(tracker_->GetTrackingResults(),
               stabilizer_->GetStabilizedResults());
+  previewer_->Init();
   
   // Show the first frame.
   previewer_->SeekAndPreviewOnce(0);

@@ -34,18 +34,18 @@ class Tracker {
     double ransac_inlier_thresh = 2.0;
 
     // Minimum inlier ratio to accept the translation model.
-    double ransac_min_inlier_ratio = 0.2;
+    double ransac_min_inlier_ratio = 0.1;
 
     // If current tracked points < this, we consider tracking poor
     // and prefer YOLO re-init (when available).
-    int reinit_pts_threshold = 40;
+    int reinit_pts_threshold = 2000;
 
     // Max per-point KLT error to keep a correspondence.
     double max_klt_error = 10.0;
 
     // For seg detector.
-    int yolo_detect_every_n_frames = 10;
-    int max_num_good_features = 100;
+    int yolo_detect_every_n_frames = 3;
+    int max_num_good_features = 2000;
     std::string select_obj_name = "airplane";
   };
 

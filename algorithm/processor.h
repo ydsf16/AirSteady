@@ -63,7 +63,7 @@ class Processor {
   void SetStatus(const Status& status);
   Status status() const { return status_.load(std::memory_order_acquire); }
 
-  bool GetVideoInfo(VideoInfo* video_info) const;
+  VideoInfo GetVideoInfo() const;
 
   // ---------------- Tracking ----------------
   // Start tracking asynchronously.
@@ -86,6 +86,7 @@ class Processor {
   bool StartPreview();
   bool HoldPreview();
   void SeekPreview(int frame_idx);
+  void SeekAndPreviewOnce(int frame_idx);
   void AddPreviewCallback(PreviewCallback cb);
 
   // ---------------- Export ----------------

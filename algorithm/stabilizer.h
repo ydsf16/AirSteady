@@ -73,7 +73,7 @@ struct StabilizerConfig {
   // Special case: smooth_factor==1 hard mode.
   double smooth_factor_one_eps = 1e-6;     // if smooth_factor >= 1 - eps => hard mode
 
-  double default_smooth_factor = 0.7;      // [0,1]
+  double default_smooth_factor = 1.0;      // [0,1]
 };
 
 // Minimal scope timer used for timing logs.

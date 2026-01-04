@@ -142,13 +142,16 @@ struct FrameTrackingResult {
 };
 
 struct FrameTrackingResultPreview {
+  int frame_idx;
+  int time_ns;
+  
   SegDetectorRes seg_detect_res;
   cv::Mat proxy_bgr;
 };
 
 struct FramePreview {
   int frame_idx = 0;
-  std::int64_t time_ns = 0;
+  int time_ns = 0;
 
   cv::Mat proxy_bgr;
 

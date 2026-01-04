@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include <glog/logging.h>
+
 namespace airsteady {
 
 namespace {
@@ -409,8 +411,8 @@ void VideoView::PaintStabilizedView(QPainter* painter, const QRectF& draw_rect,
   const double sx = draw_rect.width() / static_cast<double>(img_w);
   const double sy = draw_rect.height() / static_cast<double>(img_h);
 
-  const double tx = shift_px.x() * sx;
-  const double ty = shift_px.y() * sy;
+  const double tx = -shift_px.x() * sx;
+  const double ty = -shift_px.y() * sy;
 
   // Translate painter, then draw the image as usual to draw_rect.
   painter->save();
@@ -432,6 +434,9 @@ void VideoView::PaintStabilizedView(QPainter* painter, const QRectF& draw_rect,
 }
 
 void VideoView::paintEvent(QPaintEvent* /*event*/) {
+  LOG_EVERY_N(INFO, 60) << "VideoView paintEvent: " << title_.toStdString()
+                        << " size=" << width() << "x" << height();
+
   QPainter painter(this);
   painter.setRenderHint(QPainter::Antialiasing, true);
   painter.fillRect(rect(), QColor(20, 20, 20));

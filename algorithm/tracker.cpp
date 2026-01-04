@@ -354,6 +354,10 @@ void Tracker::Run() {
         SegDetectorRes seg_res;
         const bool has_seg =
             seg_detect_worker_->QueryResult(frame_idx, &seg_res);
+        
+        if (has_seg) {
+          track_res.seg_detect_res = seg_res;
+        }
 
         if (has_seg && seg_res.has_select_object) {
           const auto& box = seg_res.select_object.box;
@@ -404,13 +408,18 @@ void Tracker::Run() {
           std::lock_guard<std::mutex> lock(mutex_);
           track_results_.push_back(track_res);
         }
-
-        FrameTrackingResultPreview preview;
-        preview.seg_detect_res = has_seg ? seg_res : SegDetectorRes{};
-        preview.proxy_bgr = curr_frame->proxy_bgr;
-
-        for (const auto& cb : tracking_result_cbs_) {
-          cb(preview);
+        
+        if (has_seg) {
+          FrameTrackingResultPreview preview;
+          preview.seg_detect_res = has_seg ? seg_res : SegDetectorRes{};
+          preview.proxy_bgr = curr_frame->proxy_bgr;
+          preview.frame_idx = curr_frame->frame_idx;
+          preview.time_ns = curr_frame->time_ns;
+          
+          LOG(INFO) << "CURR FRAME INDEX " << preview.frame_idx;
+          for (const auto& cb : tracking_result_cbs_) {
+            cb(preview);
+          }
         }
 
         // 更新 prev_* 状态，准备下一帧

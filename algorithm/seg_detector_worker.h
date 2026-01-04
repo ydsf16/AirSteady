@@ -21,7 +21,7 @@ namespace airsteady {
 class SegDetectorWorker {
  public:
   struct Config {
-    int detect_every_n_frames = 5;
+    int detect_every_n_frames = -1;
 
     std::size_t max_num_good_features = 100;
     std::string select_obj_name = "airplane";
