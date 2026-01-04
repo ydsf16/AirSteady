@@ -23,37 +23,22 @@ message(STATUS "FFMPEG found: ${FFMPEG_FOUND}")
 find_package(cxxopts CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 
+# Direct ML Yolo.
+option(ORT_DML_VERSION "Microsoft.ML.OnnxRuntime.DirectML NuGet version" "1.23.0")
+set (ORT_DML_VERSION "1.23.0")
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/FetchOrtDml.cmake)
+fetch_ort_dml(${ORT_DML_VERSION})
+
 include_directories(
     .
+    ${ORT_DML_INCLUDE_DIR}
 )
-
-# # ---------------- 源码列表 ----------------
-# # 库的源码：不包含 exe/main.cpp
-# set(AIRSTEADY_LIB_SOURCES
-#     ui/main_window.cpp
-#     ui/video_view.cpp
-#     ui/control_panel.cpp
-#     ui/export_dialog.cpp
-#     ui/readme_dialog.cpp
-#     ui/contact_dialog.cpp
-# )
-
-# set(AIRSTEADY_LIB_HEADERS
-#     algorithm/processor.h
-
-#     ui/main_window.hpp
-#     ui/video_view.hpp
-#     ui/control_panel.hpp
-#     ui/export_dialog.hpp
-#     ui/readme_dialog.hpp
-#     ui/contact_dialog.hpp
-# )
 
 file(GLOB_RECURSE AIRSTEADY_LIB_SOURCES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/ui/*.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/algorithm/*.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/common/*.cpp"
-  
+  "${CMAKE_CURRENT_SOURCE_DIR}/yolo/*.cpp"
 )
 
 file(GLOB_RECURSE AIRSTEADY_LIB_HEADERS CONFIGURE_DEPENDS
@@ -63,6 +48,8 @@ file(GLOB_RECURSE AIRSTEADY_LIB_HEADERS CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/algorithm/*.hpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/common/*.h"
   "${CMAKE_CURRENT_SOURCE_DIR}/common/*.hpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/yolo/*.h
+  "${CMAKE_CURRENT_SOURCE_DIR}/yolo/*.hpp
 )
 
 # Exclude patterns: *_exe.cpp and *_test.cpp
@@ -82,6 +69,12 @@ else()
   )
 endif()
 
+target_compile_definitions(airsteady_lib PRIVATE
+  __STDC_CONSTANT_MACROS
+  __STDC_FORMAT_MACROS
+  __STDC_LIMIT_MACROS
+)
+
 # 头文件包含路径：作为 PUBLIC 让 exe 自动继承
 target_include_directories(airsteady_lib
     PUBLIC
@@ -100,6 +93,7 @@ target_link_libraries(airsteady_lib
         ${OpenCV_LIBS}
         glog::glog
         ${FFMPEG_LIBRARIES}
+        ${ORT_DML_LIB}
 )
 
 # Windows MSVC 一些常用编译选项

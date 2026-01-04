@@ -2,11 +2,44 @@
 
 #include <glog/logging.h>
 
+#include "common/file_utils.hpp"
+
 namespace airsteady {
 
 Tracker::Tracker(VideoPreprocessor* video_preprocessor)
     : video_preprocessor_(video_preprocessor) {
   CHECK(video_preprocessor != nullptr);
+    
+  yolo::YoloConfig yolo_cfg;
+  std::string exe_folder;
+  GetExeFolder(&exe_folder);
+  yolo_cfg.onnx_path = exe_folder  + "/model/model.onnx";
+
+  LOG(INFO) << "onnx_path: " << yolo_cfg.onnx_path; 
+
+  yolo_cfg.preferred_provider = airsteady::yolo::Provider::kDirectML;
+  yolo_cfg.enable_auto_fallback = true;
+  yolo_cfg.verbose_log = true;
+  yolo_cfg.enable_profiling = true;
+
+  yolo_seg_detector_ = std::make_shared<yolo::YoloSegDetector>(yolo_cfg);
+
+  yolo_seg_detector_->SetEventCallback([](const airsteady::yolo::DetectorEvent& ev) {
+    // 你可以接到 glog / fmt / Qt log panel
+    // 这里只用 printf 举例
+    // severity/code 你也可以映射成不同颜色
+    LOG(INFO) << "yolo: " << static_cast<int>(ev.severity) << ", " << static_cast<int>(ev.code) << ", " <<
+          ev.message.c_str() << ", " << 
+          ev.from_provider.c_str()<< ", " <<  ev.to_provider.c_str()<< ", " << 
+          ev.details.c_str();
+  });
+
+  std::string err;
+  if (!yolo_seg_detector_->Init(&err)) {
+    LOG(FATAL) << "yolo failed!!!" << err.c_str(); 
+    return;
+  }
+
 }
 
 Tracker::~Tracker() {
@@ -53,6 +86,10 @@ void Tracker::Run() {
 
     // TODO: 在这里做真正的跟踪，并往 track_results_ 里 push 结果
     LOG(INFO) << "GetFrame: " << frame->time_ns << ", " << frame->frame_idx;
+
+    std::string yolo_err;
+    yolo::YoloResult yolo_res;
+    yolo_seg_detector_->Infer(frame->proxy_bgr, &yolo_res, &yolo_err);
 
     FrameTrackingResultPreview preview;
     preview.proxy_bgr = frame->proxy_bgr;

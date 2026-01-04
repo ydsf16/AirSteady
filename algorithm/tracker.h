@@ -9,6 +9,7 @@
 
 #include "common/types.h"
 #include "algorithm/video_preprocessor.h"
+#include "yolo/yolo_seg_detector.h"
 
 namespace airsteady {
 
@@ -45,6 +46,8 @@ class Tracker {
 
   std::vector<TrackingResultCallback> tracking_result_cbs_;
   std::vector<TrackFinishedCallback> track_finished_cbs_;
+
+  std::shared_ptr<yolo::YoloSegDetector> yolo_seg_detector_;
 };
 
 }  // namespace airsteady
