@@ -117,4 +117,11 @@ struct FramePreview {
   FrameStableResult stable_res;
 };
 
+struct PreFrame {
+  int64_t time_ns = 0;
+  int frame_idx = 0;
+  cv::Mat proxy_bgr;
+  cv::Mat proxy_gray;
+};
+
 }  // namespace airsteady

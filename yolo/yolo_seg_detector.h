@@ -24,6 +24,7 @@ class YoloSegDetector {
   RuntimeStatus GetStatus() const;
 
   bool Init(std::string* err);
+  bool Initialized();
 
   bool Infer(const cv::Mat& bgr, YoloResult* out, std::string* err);
 
@@ -31,6 +32,8 @@ class YoloSegDetector {
                   std::vector<YoloResult>* out_list,
                   std::string* err);
 
+  std::string ClassName(int class_id) const;
+  
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

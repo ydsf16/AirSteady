@@ -22,12 +22,7 @@ extern "C" {
 
 namespace airsteady {
 
-struct PreFrame {
-  int64_t time_ns = 0;
-  int frame_idx = 0;
-  cv::Mat proxy_bgr;
-  cv::Mat proxy_gray;
-};
+
 
 // 负责：
 // 1. 打开源视频，优先用硬件解码，失败则回退 CPU 解码

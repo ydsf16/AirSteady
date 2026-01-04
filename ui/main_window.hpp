@@ -7,6 +7,7 @@
 #include <opencv2/opencv.hpp>
 
 #include "algorithm/processor.h"
+#include "yolo/yolo_seg_detector.h"
 
 class QLabel;
 class QPushButton;

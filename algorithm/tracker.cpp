@@ -34,12 +34,15 @@ Tracker::Tracker(VideoPreprocessor* video_preprocessor)
           ev.details.c_str();
   });
 
-  std::string err;
-  if (!yolo_seg_detector_->Init(&err)) {
-    LOG(FATAL) << "yolo failed!!!" << err.c_str(); 
-    return;
-  }
+  SegDetectorWorker::Config seg_detect_worker_cfg;
+  seg_detect_worker_ = 
+    std::make_shared<SegDetectorWorker>(seg_detect_worker_cfg, yolo_seg_detector_);
 
+  // std::string err;
+  // if (!yolo_seg_detector_->Init(&err)) {
+  //   LOG(FATAL) << "yolo failed!!!" << err.c_str(); 
+  //   return;
+  // }
 }
 
 Tracker::~Tracker() {
@@ -87,9 +90,8 @@ void Tracker::Run() {
     // TODO: 在这里做真正的跟踪，并往 track_results_ 里 push 结果
     LOG(INFO) << "GetFrame: " << frame->time_ns << ", " << frame->frame_idx;
 
-    std::string yolo_err;
-    yolo::YoloResult yolo_res;
-    yolo_seg_detector_->Infer(frame->proxy_bgr, &yolo_res, &yolo_err);
+    // Feed frame to seg detector worker.
+    seg_detect_worker_->FeedFrame(frame);
 
     FrameTrackingResultPreview preview;
     preview.proxy_bgr = frame->proxy_bgr;
