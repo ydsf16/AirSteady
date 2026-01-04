@@ -8,6 +8,8 @@
 #include <Eigen/Core>
 #include <opencv2/core/mat.hpp>
 
+#include "yolo/yolo_types.h"
+
 namespace airsteady {
 
 struct StableParams {
@@ -75,9 +77,52 @@ struct BBox {
   double height = 0.0;
 };
 
-struct FrameTrackingResult {
+
+struct FrameStableResult {
   int frame_idx = 0;
   std::int64_t time_ns = 0;
+
+  double delta_u = 0.0;
+  double delta_v = 0.0;
+  double delta_yaw = 0.0;
+};
+
+struct PreFrame {
+  int64_t time_ns = 0;
+  int frame_idx = 0;
+  cv::Mat proxy_bgr;
+  cv::Mat proxy_gray;
+};
+
+
+// Per-frame timing stats for debugging and profiling.
+struct SegDetectorTiming {
+  double yolo_ms = 0.0;           // YOLO inference time.
+  double select_object_ms = 0.0;  // Object selection + GFTT pipeline time.
+  double gftt_ms = 0.0;           // goodFeaturesToTrack time (subset of select).
+  double total_ms = 0.0;          // End-to-end time inside RunDetection.
+};
+
+struct SegDetectorRes {
+  int frame_idx = -1;
+  std::int64_t time_ns = 0;
+
+  // All detections in this frame.
+  std::vector<yolo::Det> yolo_objects;
+
+  // Selected tracking target.
+  bool has_select_object = false;
+  yolo::Det select_object;
+  // Good features (float) inside target (after mask filtering).
+  std::vector<cv::Point2f> good_pts_to_track;
+
+  // Timing stats.
+  SegDetectorTiming timing;
+};
+
+struct FrameTrackingResult {
+  int frame_idx = 0;
+  int time_ns = 0;
 
   // Delta frame result.
   bool delta_valid = false;
@@ -90,21 +135,8 @@ struct FrameTrackingResult {
 };
 
 struct FrameTrackingResultPreview {
-  FrameTrackingResult track_res;
-
+  SegDetectorRes seg_detect_res;
   cv::Mat proxy_bgr;
-  std::vector<BBox> bboxes;
-
-  double progress_ratio = 0.0;
-};
-
-struct FrameStableResult {
-  int frame_idx = 0;
-  std::int64_t time_ns = 0;
-
-  double delta_u = 0.0;
-  double delta_v = 0.0;
-  double delta_yaw = 0.0;
 };
 
 struct FramePreview {
@@ -115,13 +147,6 @@ struct FramePreview {
 
   FrameTrackingResult track_res;
   FrameStableResult stable_res;
-};
-
-struct PreFrame {
-  int64_t time_ns = 0;
-  int frame_idx = 0;
-  cv::Mat proxy_bgr;
-  cv::Mat proxy_gray;
 };
 
 }  // namespace airsteady

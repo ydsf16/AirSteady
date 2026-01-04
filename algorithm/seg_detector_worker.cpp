@@ -187,7 +187,6 @@ bool SegDetectorWorker::ShouldRunDetect(int frame_idx) {
   const int delta = frame_idx - last_detect_frame_idx_;
   return delta >= config_.detect_every_n_frames;
 }
-
 void SegDetectorWorker::RunDetection(const std::shared_ptr<PreFrame>& pre_frame,
                                      SegDetectorRes* out_res) {
   if (!out_res) {
@@ -223,9 +222,22 @@ void SegDetectorWorker::RunDetection(const std::shared_ptr<PreFrame>& pre_frame,
 
   last_detect_frame_idx_ = frame_idx;
 
-  out_res->yolo_objects = det_res.dets;
+  // ---------------- 过滤出指定类别的 det，写入 yolo_objects ----------------
+  const std::string& target_name = config_.select_obj_name;
+  const std::size_t total_dets = det_res.dets.size();
 
-  // Object selection + GFTT.
+  out_res->yolo_objects.clear();
+  out_res->yolo_objects.reserve(total_dets);
+
+  for (const auto& det : det_res.dets) {
+    const std::string cls_name = yolo_seg_detector_->ClassName(det.class_id);
+    if (cls_name == target_name) {
+      out_res->yolo_objects.push_back(det);
+    }
+  }
+  const std::size_t filtered_dets = out_res->yolo_objects.size();
+
+  // Object selection + GFTT（仍然用完整 det_res 做选择逻辑）
   const auto t_select_begin = Clock::now();
   SelectObjectAndExtractGftt(pre_frame->proxy_bgr,
                              pre_frame->proxy_gray,
@@ -242,7 +254,8 @@ void SegDetectorWorker::RunDetection(const std::shared_ptr<PreFrame>& pre_frame,
   }
 
   LOG(INFO) << "[SegDetectorWorker] Frame " << frame_idx
-            << " dets=" << det_res.dets.size()
+            << " dets_total=" << total_dets
+            << ", dets_filtered(" << target_name << ")=" << filtered_dets
             << ", yolo_ms=" << timing.yolo_ms
             << ", select_ms=" << timing.select_object_ms
             << ", gftt_ms=" << timing.gftt_ms

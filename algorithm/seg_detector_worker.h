@@ -18,31 +18,6 @@
 
 namespace airsteady {
 
-// Per-frame timing stats for debugging and profiling.
-struct SegDetectorTiming {
-  double yolo_ms = 0.0;           // YOLO inference time.
-  double select_object_ms = 0.0;  // Object selection + GFTT pipeline time.
-  double gftt_ms = 0.0;           // goodFeaturesToTrack time (subset of select).
-  double total_ms = 0.0;          // End-to-end time inside RunDetection.
-};
-
-struct SegDetectorRes {
-  int frame_idx = -1;
-  std::int64_t time_ns = 0;
-
-  // All detections in this frame.
-  std::vector<yolo::Det> yolo_objects;
-
-  // Selected tracking target.
-  bool has_select_object = false;
-  yolo::Det select_object;
-  // Good features (float) inside target (after mask filtering).
-  std::vector<cv::Point2f> good_pts_to_track;
-
-  // Timing stats.
-  SegDetectorTiming timing;
-};
-
 class SegDetectorWorker {
  public:
   struct Config {
@@ -52,7 +27,7 @@ class SegDetectorWorker {
     std::string select_obj_name = "airplane";
 
     // Debug draw
-    bool enable_debug = true;
+    bool enable_debug = false;
     std::string debug_window_name = "SegDetectorDebug";
   };
 
