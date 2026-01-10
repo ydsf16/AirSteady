@@ -443,337 +443,134 @@ bool Stabilizer::SolveSparseSPD(int n,
   return true;
 }
 
-std::vector<Eigen::Vector2d> Stabilizer::ComputeObjectCentersIRLS(
-    StabilizerDebugInfo* dbg) const {
-  const int n = static_cast<int>(track_ress_.size());
-  std::vector<Eigen::Vector2d> p(n, Eigen::Vector2d::Zero());
-  if (n == 0) return p;
-
-  const Eigen::Vector2d img_center = ImageCenterProxy(video_info_);
-  const double w = static_cast<double>(video_info_.proxy_width);
-  const double h = static_cast<double>(video_info_.proxy_height);
-
-  auto clamp_xy = [&](Eigen::Vector2d* v) {
-    // if (!v) return;
-    // return *v;
-    
-    // // clamp to [0, w-1], [0, h-1]
-    // (*v).x() = std::max(0.0, std::min((*v).x(), std::max(0.0, w - 1.0)));
-    // (*v).y() = std::max(0.0, std::min((*v).y(), std::max(0.0, h - 1.0)));
-  };
-
-  // 1) Find the first valid global center as anchor.
-  int anchor = -1;
-  for (int i = 0; i < n; ++i) {
-    if (track_ress_[i].global_center_valid) {
-      anchor = i;
-      break;
-    }
-  }
-
-  if (anchor < 0) {
-    // No valid global center at all: fallback to image center + pure odom integration from frame 0.
-    p[0] = img_center;
-    clamp_xy(&p[0]);
-
-    for (int i = 1; i < n; ++i) {
-      const auto& tr = track_ress_[i];
-      Eigen::Vector2d di = Eigen::Vector2d::Zero();
-      if (tr.delta_valid) {
-        di = tr.delta;
-      } else {
-        // invalid delta: keep previous (0 increment). You can also choose
-        // to use last valid delta or damped velocity, but simplest is 0.
-        di.setZero();
-      }
-      p[i] = p[i - 1] + di;
-      clamp_xy(&p[i]);
-    }
-
-    if (dbg) {
-      // Residual stats are not meaningful for this integrator; set to zeros for clarity.
-      dbg->step1_global = ResidualStats{};
-      dbg->step1_odom = ResidualStats{};
-    }
-
-    LOG(INFO) << "[Stabilizer][Step1-Integrate] no global_center_valid found, "
-              << "fallback anchor at frame0=image_center, integrated with delta.";
-    return p;
-  }
-
-  // 2) Set anchor position.
-  p[anchor] = track_ress_[anchor].global_center;
-  clamp_xy(&p[anchor]);
-
-  // 3) Forward integration: anchor -> end.
-  int forward_valid_delta_cnt = 0;
-  int forward_invalid_delta_cnt = 0;
-  for (int i = anchor + 1; i < n; ++i) {
-    const auto& tr = track_ress_[i];  // delta(i) is between i-1 and i
-    Eigen::Vector2d di = Eigen::Vector2d::Zero();
-    if (tr.delta_valid) {
-      di = tr.delta;
-      ++forward_valid_delta_cnt;
-    } else {
-      di.setZero();
-      ++forward_invalid_delta_cnt;
-      LOG(WARNING) << "HAS INVALID DELTE!!!!";
-    }
-    p[i] = p[i - 1] + di;
-    clamp_xy(&p[i]);
-  }
-
-  // 4) Backward integration: anchor -> 0.
-  // Need delta between i and i+1 (stored at tr[i+1]).
-  int backward_valid_delta_cnt = 0;
-  int backward_invalid_delta_cnt = 0;
-  for (int i = anchor - 1; i >= 0; --i) {
-    const auto& tr_next = track_ress_[i + 1];  // delta(i+1) = p[i+1] - p[i]
-    Eigen::Vector2d di = Eigen::Vector2d::Zero();
-    if (tr_next.delta_valid) {
-      di = tr_next.delta;
-      ++backward_valid_delta_cnt;
-    } else {
-      di.setZero();
-      ++backward_invalid_delta_cnt;
-    }
-    // p[i] = p[i+1] - delta(i+1)
-    p[i] = p[i + 1] - di;
-    clamp_xy(&p[i]);
-  }
-
-  if (config_.timing_log) {
-    LOG(INFO) << "[Stabilizer][Step1-Integrate] anchor=" << anchor
-              << " (frame_idx=" << track_ress_[anchor].frame_idx << ")"
-              << ", forward(valid=" << forward_valid_delta_cnt
-              << ", invalid=" << forward_invalid_delta_cnt << ")"
-              << ", backward(valid=" << backward_valid_delta_cnt
-              << ", invalid=" << backward_invalid_delta_cnt << ")";
-  }
-
-  if (dbg) {
-    // Optional: compute diagnostic residuals vs detector & delta for reporting only.
-    // (Not used to optimize.)
-    std::vector<double> r_global;
-    std::vector<double> r_odom;
-    r_global.reserve(n);
-    r_odom.reserve(std::max(0, n - 1));
-
-    for (int i = 0; i < n; ++i) {
-      const auto& tr = track_ress_[i];
-      if (tr.global_center_valid) {
-        r_global.push_back((p[i] - tr.global_center).norm());
-      }
-    }
-
-    for (int i = 1; i < n; ++i) {
-      const auto& tr = track_ress_[i];
-      if (!tr.delta_valid) continue;
-      const Eigen::Vector2d r = (p[i] - p[i - 1]) - tr.delta;
-      r_odom.push_back(r.norm());
-    }
-
-    dbg->step1_global = ComputeResidualStats(r_global);
-    dbg->step1_odom = ComputeResidualStats(r_odom);
-  }
-
-  return p;
-}
-
-// ---------------- Step 1: Object centers (IRLS + Huber) ----------------
-// std::vector<Eigen::Vector2d> Stabilizer::ComputeObjectCentersIRLS(StabilizerDebugInfo* dbg) const {
+// std::vector<Eigen::Vector2d> Stabilizer::ComputeObjectCentersIRLS(
+//     StabilizerDebugInfo* dbg) const {
 //   const int n = static_cast<int>(track_ress_.size());
 //   std::vector<Eigen::Vector2d> p(n, Eigen::Vector2d::Zero());
 //   if (n == 0) return p;
 
 //   const Eigen::Vector2d img_center = ImageCenterProxy(video_info_);
+//   const double w = static_cast<double>(video_info_.proxy_width);
+//   const double h = static_cast<double>(video_info_.proxy_height);
 
-//   // Initial guess: detector if valid; otherwise image center.
+//   auto clamp_xy = [&](Eigen::Vector2d* v) {
+//     // if (!v) return;
+//     // return *v;
+    
+//     // // clamp to [0, w-1], [0, h-1]
+//     // (*v).x() = std::max(0.0, std::min((*v).x(), std::max(0.0, w - 1.0)));
+//     // (*v).y() = std::max(0.0, std::min((*v).y(), std::max(0.0, h - 1.0)));
+//   };
+
+//   // 1) Find the first valid global center as anchor.
+//   int anchor = -1;
 //   for (int i = 0; i < n; ++i) {
 //     if (track_ress_[i].global_center_valid) {
-//       p[i] = track_ress_[i].global_center;
-//     } else {
-//       p[i] = img_center;
-//     }
-//   }
-
-//   struct Unary {
-//     int i;
-//     Eigen::Vector2d meas;
-//     double base_w;
-//     bool is_detector;  // true if from detector
-//   };
-//   struct Binary {
-//     int i0;
-//     int i1;
-//     Eigen::Vector2d meas;  // delta or 0
-//     double base_w;
-//     bool is_delta;         // true if delta_valid
-//   };
-
-//   std::vector<Unary> unaries;
-//   std::vector<Binary> binaries;
-//   unaries.reserve(n);
-//   binaries.reserve(std::max(0, n - 1));
-
-//   int detector_cnt = 0;
-//   int weak_center_cnt = 0;
-//   int delta_cnt = 0;
-//   int weak_odom_cnt = 0;
-
-//   for (int i = 0; i < n; ++i) {
-//     const auto& tr = track_ress_[i];
-//     if (tr.global_center_valid) {
-//       unaries.push_back(Unary{i, tr.global_center, WeightFromSigma(config_.global_sigma_px), true});
-//       ++detector_cnt;
-//     } else {
-//       unaries.push_back(Unary{i, img_center, WeightFromSigma(config_.weak_center_sigma_px), false});
-//       ++weak_center_cnt;
-//     }
-//   }
-
-//   for (int i = 1; i < n; ++i) {
-//     const auto& tr = track_ress_[i];
-//     if (tr.delta_valid) {
-//       double sigma = (std::isfinite(tr.delta_noise) && tr.delta_noise > 0.0)
-//                                ? std::max(tr.delta_noise, config_.odom_sigma_px)
-//                                : config_.odom_sigma_px;
-//       // debug :sigma = 
-//       sigma = config_.odom_sigma_px;
-//       binaries.push_back(Binary{i - 1, i, tr.delta, WeightFromSigma(sigma), true});
-//       ++delta_cnt;
-//     } else {
-//       // LOG(FATAL) << "MUST NOT BE HRERE!!!";
-//       binaries.push_back(Binary{i - 1, i, Eigen::Vector2d::Zero(),
-//                                 WeightFromSigma(config_.odom_invalid_sigma_px), false});
-//       ++weak_odom_cnt;
-//     }
-//   }
-
-//   if (config_.timing_log) {
-//     LOG(INFO) << "[Stabilizer][Step1] constraints: unary=" << unaries.size()
-//               << " (detector=" << detector_cnt << " weak_center=" << weak_center_cnt << ")"
-//               << ", binary=" << binaries.size()
-//               << " (delta=" << delta_cnt << " weak=" << weak_odom_cnt << ")";
-//   }
-
-//   auto solve_axis = [&](int axis,
-//                         const std::vector<double>& robust_w_unary,
-//                         const std::vector<double>& robust_w_binary,
-//                         const char* tag) -> Eigen::VectorXd {
-//     std::vector<Eigen::Triplet<double>> Ht;
-//     Ht.reserve(n * 12);
-//     Eigen::VectorXd g = Eigen::VectorXd::Zero(n);
-
-//     auto add_unary = [&](int i, double w, double meas) {
-//       Ht.emplace_back(i, i, w);
-//       g(i) += w * meas;
-//     };
-
-//     auto add_binary = [&](int i0, int i1, double w, double d01) {
-//       Ht.emplace_back(i1, i1, w);
-//       Ht.emplace_back(i0, i0, w);
-//       Ht.emplace_back(i1, i0, -w);
-//       Ht.emplace_back(i0, i1, -w);
-//       g(i1) += w * d01;
-//       g(i0) -= w * d01;
-//     };
-
-//     for (size_t k = 0; k < unaries.size(); ++k) {
-//       const auto& c = unaries[k];
-//       const double meas = (axis == 0) ? c.meas.x() : c.meas.y();
-//       const double w = c.base_w * robust_w_unary[k];
-//       add_unary(c.i, w, meas);
-//     }
-//     for (size_t k = 0; k < binaries.size(); ++k) {
-//       const auto& c = binaries[k];
-//       const double meas = (axis == 0) ? c.meas.x() : c.meas.y();
-//       const double w = c.base_w * robust_w_binary[k];
-//       add_binary(c.i0, c.i1, w, meas);
-//     }
-
-//     Eigen::VectorXd x(n);
-//     std::string err;
-//     if (!SolveSparseSPD(n, Ht, g, tag, &x, &err)) {
-//       LOG(INFO) << "[Stabilizer][Solve] FAILED: " << err << " (fallback used)";
-//       return Eigen::VectorXd::Constant(n, (axis == 0) ? img_center.x() : img_center.y());
-//     }
-//     return x;
-//   };
-
-//   const bool use_robust = config_.robust_enable;
-
-//   for (int it = 0; it < std::max(1, config_.irls_max_iters); ++it) {
-//     if (stop_.load()) break;
-
-//     const bool log_this_iter =
-//         config_.timing_log && ((it % std::max(1, config_.timing_log_every_irls_iter)) == 0);
-
-//     ScopedTimer t_iter("  Step1-IRLS-Iter", log_this_iter);
-
-//     std::vector<double> rw_u(unaries.size(), 1.0);
-//     std::vector<double> rw_b(binaries.size(), 1.0);
-
-//     if (use_robust) {
-//       for (size_t k = 0; k < unaries.size(); ++k) {
-//         const auto& c = unaries[k];
-//         const Eigen::Vector2d r = p[c.i] - c.meas;
-//         rw_u[k] = HuberWeight(r.norm());
-//       }
-//       for (size_t k = 0; k < binaries.size(); ++k) {
-//         const auto& c = binaries[k];
-//         const Eigen::Vector2d r = (p[c.i1] - p[c.i0]) - c.meas;
-//         rw_b[k] = HuberWeight(r.norm());
-//       }
-//     }
-
-//     Eigen::VectorXd xs, ys;
-//     {
-//       ScopedTimer t("    Step1-Solve(X)", log_this_iter);
-//       xs = solve_axis(0, rw_u, rw_b, "Step1-X");
-//     }
-//     {
-//       ScopedTimer t("    Step1-Solve(Y)", log_this_iter);
-//       ys = solve_axis(1, rw_u, rw_b, "Step1-Y");
-//     }
-
-//     double avg_change = 0.0;
-//     for (int i = 0; i < n; ++i) {
-//       const Eigen::Vector2d p_new(xs(i), ys(i));
-//       avg_change += (p_new - p[i]).norm();
-//       p[i] = p_new;
-//     }
-//     avg_change /= std::max(1, n);
-
-//     if (log_this_iter) {
-//       LOG(INFO) << "[Stabilizer][Step1] iter=" << it
-//                 << " avg_change=" << std::fixed << std::setprecision(4) << avg_change << " px";
-//     }
-
-//     if (avg_change < config_.irls_eps_px) {
-//       if (config_.timing_log) {
-//         LOG(INFO) << "[Stabilizer][Step1] early stop: avg_change("
-//                   << std::fixed << std::setprecision(4) << avg_change
-//                   << ") < eps(" << config_.irls_eps_px << ")";
-//       }
+//       anchor = i;
 //       break;
 //     }
 //   }
 
-//   // Residual stats (final).
+//   if (anchor < 0) {
+//     // No valid global center at all: fallback to image center + pure odom integration from frame 0.
+//     p[0] = img_center;
+//     clamp_xy(&p[0]);
+
+//     for (int i = 1; i < n; ++i) {
+//       const auto& tr = track_ress_[i];
+//       Eigen::Vector2d di = Eigen::Vector2d::Zero();
+//       if (tr.delta_valid) {
+//         di = tr.delta;
+//       } else {
+//         // invalid delta: keep previous (0 increment). You can also choose
+//         // to use last valid delta or damped velocity, but simplest is 0.
+//         di.setZero();
+//       }
+//       p[i] = p[i - 1] + di;
+//       clamp_xy(&p[i]);
+//     }
+
+//     if (dbg) {
+//       // Residual stats are not meaningful for this integrator; set to zeros for clarity.
+//       dbg->step1_global = ResidualStats{};
+//       dbg->step1_odom = ResidualStats{};
+//     }
+
+//     LOG(INFO) << "[Stabilizer][Step1-Integrate] no global_center_valid found, "
+//               << "fallback anchor at frame0=image_center, integrated with delta.";
+//     return p;
+//   }
+
+//   // 2) Set anchor position.
+//   p[anchor] = track_ress_[anchor].global_center;
+//   clamp_xy(&p[anchor]);
+
+//   // 3) Forward integration: anchor -> end.
+//   int forward_valid_delta_cnt = 0;
+//   int forward_invalid_delta_cnt = 0;
+//   for (int i = anchor + 1; i < n; ++i) {
+//     const auto& tr = track_ress_[i];  // delta(i) is between i-1 and i
+//     Eigen::Vector2d di = Eigen::Vector2d::Zero();
+//     if (tr.delta_valid) {
+//       di = tr.delta;
+//       ++forward_valid_delta_cnt;
+//     } else {
+//       di.setZero();
+//       ++forward_invalid_delta_cnt;
+//       LOG(WARNING) << "HAS INVALID DELTE!!!!";
+//     }
+//     p[i] = p[i - 1] + di;
+//     clamp_xy(&p[i]);
+//   }
+
+//   // 4) Backward integration: anchor -> 0.
+//   // Need delta between i and i+1 (stored at tr[i+1]).
+//   int backward_valid_delta_cnt = 0;
+//   int backward_invalid_delta_cnt = 0;
+//   for (int i = anchor - 1; i >= 0; --i) {
+//     const auto& tr_next = track_ress_[i + 1];  // delta(i+1) = p[i+1] - p[i]
+//     Eigen::Vector2d di = Eigen::Vector2d::Zero();
+//     if (tr_next.delta_valid) {
+//       di = tr_next.delta;
+//       ++backward_valid_delta_cnt;
+//     } else {
+//       di.setZero();
+//       ++backward_invalid_delta_cnt;
+//     }
+//     // p[i] = p[i+1] - delta(i+1)
+//     p[i] = p[i + 1] - di;
+//     clamp_xy(&p[i]);
+//   }
+
+//   if (config_.timing_log) {
+//     LOG(INFO) << "[Stabilizer][Step1-Integrate] anchor=" << anchor
+//               << " (frame_idx=" << track_ress_[anchor].frame_idx << ")"
+//               << ", forward(valid=" << forward_valid_delta_cnt
+//               << ", invalid=" << forward_invalid_delta_cnt << ")"
+//               << ", backward(valid=" << backward_valid_delta_cnt
+//               << ", invalid=" << backward_invalid_delta_cnt << ")";
+//   }
+
 //   if (dbg) {
+//     // Optional: compute diagnostic residuals vs detector & delta for reporting only.
+//     // (Not used to optimize.)
 //     std::vector<double> r_global;
 //     std::vector<double> r_odom;
-//     r_global.reserve(unaries.size());
-//     r_odom.reserve(binaries.size());
+//     r_global.reserve(n);
+//     r_odom.reserve(std::max(0, n - 1));
 
-//     for (const auto& c : unaries) {
-//       if (!c.is_detector) continue;
-//       r_global.push_back((p[c.i] - c.meas).norm());
+//     for (int i = 0; i < n; ++i) {
+//       const auto& tr = track_ress_[i];
+//       if (tr.global_center_valid) {
+//         r_global.push_back((p[i] - tr.global_center).norm());
+//       }
 //     }
-//     for (const auto& c : binaries) {
-//       if (!c.is_delta) continue;
-//       r_odom.push_back(((p[c.i1] - p[c.i0]) - c.meas).norm());
+
+//     for (int i = 1; i < n; ++i) {
+//       const auto& tr = track_ress_[i];
+//       if (!tr.delta_valid) continue;
+//       const Eigen::Vector2d r = (p[i] - p[i - 1]) - tr.delta;
+//       r_odom.push_back(r.norm());
 //     }
 
 //     dbg->step1_global = ComputeResidualStats(r_global);
@@ -782,6 +579,209 @@ std::vector<Eigen::Vector2d> Stabilizer::ComputeObjectCentersIRLS(
 
 //   return p;
 // }
+
+// ---------------- Step 1: Object centers (IRLS + Huber) ----------------
+std::vector<Eigen::Vector2d> Stabilizer::ComputeObjectCentersIRLS(StabilizerDebugInfo* dbg) const {
+  const int n = static_cast<int>(track_ress_.size());
+  std::vector<Eigen::Vector2d> p(n, Eigen::Vector2d::Zero());
+  if (n == 0) return p;
+
+  const Eigen::Vector2d img_center = ImageCenterProxy(video_info_);
+
+  // Initial guess: detector if valid; otherwise image center.
+  for (int i = 0; i < n; ++i) {
+    if (track_ress_[i].global_center_valid) {
+      p[i] = track_ress_[i].global_center;
+    } else {
+      p[i] = img_center;
+    }
+  }
+
+  struct Unary {
+    int i;
+    Eigen::Vector2d meas;
+    double base_w;
+    bool is_detector;  // true if from detector
+  };
+  struct Binary {
+    int i0;
+    int i1;
+    Eigen::Vector2d meas;  // delta or 0
+    double base_w;
+    bool is_delta;         // true if delta_valid
+  };
+
+  std::vector<Unary> unaries;
+  std::vector<Binary> binaries;
+  unaries.reserve(n);
+  binaries.reserve(std::max(0, n - 1));
+
+  int detector_cnt = 0;
+  int weak_center_cnt = 0;
+  int delta_cnt = 0;
+  int weak_odom_cnt = 0;
+
+  for (int i = 0; i < n; ++i) {
+    const auto& tr = track_ress_[i];
+    if (tr.global_center_valid) {
+      unaries.push_back(Unary{i, tr.global_center, WeightFromSigma(config_.global_sigma_px), true});
+      ++detector_cnt;
+    } else {
+      unaries.push_back(Unary{i, img_center, WeightFromSigma(config_.weak_center_sigma_px), false});
+      ++weak_center_cnt;
+    }
+  }
+
+  for (int i = 1; i < n; ++i) {
+    const auto& tr = track_ress_[i];
+    if (tr.delta_valid) {
+      double sigma = (std::isfinite(tr.delta_noise) && tr.delta_noise > 0.0)
+                               ? std::max(tr.delta_noise, config_.odom_sigma_px)
+                               : config_.odom_sigma_px;
+      // debug :sigma = 
+      sigma = config_.odom_sigma_px;
+      binaries.push_back(Binary{i - 1, i, tr.delta, WeightFromSigma(sigma), true});
+      ++delta_cnt;
+    } else {
+      // LOG(FATAL) << "MUST NOT BE HRERE!!!";
+      binaries.push_back(Binary{i - 1, i, Eigen::Vector2d::Zero(),
+                                WeightFromSigma(config_.odom_invalid_sigma_px), false});
+      ++weak_odom_cnt;
+    }
+  }
+
+  if (config_.timing_log) {
+    LOG(INFO) << "[Stabilizer][Step1] constraints: unary=" << unaries.size()
+              << " (detector=" << detector_cnt << " weak_center=" << weak_center_cnt << ")"
+              << ", binary=" << binaries.size()
+              << " (delta=" << delta_cnt << " weak=" << weak_odom_cnt << ")";
+  }
+
+  auto solve_axis = [&](int axis,
+                        const std::vector<double>& robust_w_unary,
+                        const std::vector<double>& robust_w_binary,
+                        const char* tag) -> Eigen::VectorXd {
+    std::vector<Eigen::Triplet<double>> Ht;
+    Ht.reserve(n * 12);
+    Eigen::VectorXd g = Eigen::VectorXd::Zero(n);
+
+    auto add_unary = [&](int i, double w, double meas) {
+      Ht.emplace_back(i, i, w);
+      g(i) += w * meas;
+    };
+
+    auto add_binary = [&](int i0, int i1, double w, double d01) {
+      Ht.emplace_back(i1, i1, w);
+      Ht.emplace_back(i0, i0, w);
+      Ht.emplace_back(i1, i0, -w);
+      Ht.emplace_back(i0, i1, -w);
+      g(i1) += w * d01;
+      g(i0) -= w * d01;
+    };
+
+    for (size_t k = 0; k < unaries.size(); ++k) {
+      const auto& c = unaries[k];
+      const double meas = (axis == 0) ? c.meas.x() : c.meas.y();
+      const double w = c.base_w * robust_w_unary[k];
+      add_unary(c.i, w, meas);
+    }
+    for (size_t k = 0; k < binaries.size(); ++k) {
+      const auto& c = binaries[k];
+      const double meas = (axis == 0) ? c.meas.x() : c.meas.y();
+      const double w = c.base_w * robust_w_binary[k];
+      add_binary(c.i0, c.i1, w, meas);
+    }
+
+    Eigen::VectorXd x(n);
+    std::string err;
+    if (!SolveSparseSPD(n, Ht, g, tag, &x, &err)) {
+      LOG(INFO) << "[Stabilizer][Solve] FAILED: " << err << " (fallback used)";
+      return Eigen::VectorXd::Constant(n, (axis == 0) ? img_center.x() : img_center.y());
+    }
+    return x;
+  };
+
+  const bool use_robust = config_.robust_enable;
+
+  for (int it = 0; it < std::max(1, config_.irls_max_iters); ++it) {
+    if (stop_.load()) break;
+
+    const bool log_this_iter =
+        config_.timing_log && ((it % std::max(1, config_.timing_log_every_irls_iter)) == 0);
+
+    ScopedTimer t_iter("  Step1-IRLS-Iter", log_this_iter);
+
+    std::vector<double> rw_u(unaries.size(), 1.0);
+    std::vector<double> rw_b(binaries.size(), 1.0);
+
+    if (use_robust) {
+      for (size_t k = 0; k < unaries.size(); ++k) {
+        const auto& c = unaries[k];
+        const Eigen::Vector2d r = p[c.i] - c.meas;
+        rw_u[k] = HuberWeight(r.norm());
+      }
+      for (size_t k = 0; k < binaries.size(); ++k) {
+        const auto& c = binaries[k];
+        const Eigen::Vector2d r = (p[c.i1] - p[c.i0]) - c.meas;
+        rw_b[k] = HuberWeight(r.norm());
+      }
+    }
+
+    Eigen::VectorXd xs, ys;
+    {
+      ScopedTimer t("    Step1-Solve(X)", log_this_iter);
+      xs = solve_axis(0, rw_u, rw_b, "Step1-X");
+    }
+    {
+      ScopedTimer t("    Step1-Solve(Y)", log_this_iter);
+      ys = solve_axis(1, rw_u, rw_b, "Step1-Y");
+    }
+
+    double avg_change = 0.0;
+    for (int i = 0; i < n; ++i) {
+      const Eigen::Vector2d p_new(xs(i), ys(i));
+      avg_change += (p_new - p[i]).norm();
+      p[i] = p_new;
+    }
+    avg_change /= std::max(1, n);
+
+    if (log_this_iter) {
+      LOG(INFO) << "[Stabilizer][Step1] iter=" << it
+                << " avg_change=" << std::fixed << std::setprecision(4) << avg_change << " px";
+    }
+
+    if (avg_change < config_.irls_eps_px) {
+      if (config_.timing_log) {
+        LOG(INFO) << "[Stabilizer][Step1] early stop: avg_change("
+                  << std::fixed << std::setprecision(4) << avg_change
+                  << ") < eps(" << config_.irls_eps_px << ")";
+      }
+      break;
+    }
+  }
+
+  // Residual stats (final).
+  if (dbg) {
+    std::vector<double> r_global;
+    std::vector<double> r_odom;
+    r_global.reserve(unaries.size());
+    r_odom.reserve(binaries.size());
+
+    for (const auto& c : unaries) {
+      if (!c.is_detector) continue;
+      r_global.push_back((p[c.i] - c.meas).norm());
+    }
+    for (const auto& c : binaries) {
+      if (!c.is_delta) continue;
+      r_odom.push_back(((p[c.i1] - p[c.i0]) - c.meas).norm());
+    }
+
+    dbg->step1_global = ComputeResidualStats(r_global);
+    dbg->step1_odom = ComputeResidualStats(r_odom);
+  }
+
+  return p;
+}
 
 // ---------------- Step 2: Smooth/target centers (IRLS + Huber on data term) ----------------
 std::vector<Eigen::Vector2d> Stabilizer::ComputeSmoothCentersIRLS(

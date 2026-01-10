@@ -33,6 +33,8 @@ Processor::Processor(const Config& config) : config_(config) {
   // 预览器
   previewer_ = std::make_shared<Previewer>(proxy_path); 
 
+  video_exportor_ = std::make_shared<VideoExportor>();
+
   // Idle
   SetStatus(Status::kIdle);
 }
@@ -125,14 +127,24 @@ void Processor::AddPreviewDoneCallback(std::function<void()> cb) {
   previewer_->AddPreviewDoneCallback(cb);
 }
 
-bool Processor::StartExport(std::string* err) {
-  (void)err;
-  return false;
+void Processor::SetExportParams(const ExportParams& export_params) {
+  config_.export_params = export_params;
 }
 
-bool Processor::AddExportCallback(ExportProgressCallback cb) {
-  export_progress_cbs_.push_back(std::move(cb));
-  return true;
+void Processor::StartExport() {
+  const auto& stable_results = stabilizer_->GetStabilizedResults();
+  video_exportor_->StartExport(config_.video_path,
+                               video_info_,
+                               config_.export_params,
+                               stable_results);
+}
+
+void Processor::AddExportCallback(ExportProgressCallback cb) {
+  video_exportor_->AddExportCallback(cb);
+}
+
+void Processor::AddExportDoneCallback(std::function<void()> cb) {
+  video_exportor_->AddExportDoneCallback(cb);
 }
 
 bool Processor::Save(const std::string& work_folder) {

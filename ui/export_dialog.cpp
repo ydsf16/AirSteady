@@ -18,7 +18,7 @@ namespace airsteady {
 namespace {
 
 constexpr int kMinBitrateMbps = 1;
-constexpr int kMaxBitrateMbps = 500;
+constexpr int kMaxBitrateMbps = 200;
 constexpr int kDefaultBitrateMbps = 20;
 
 // export_resolution encoding (int):
@@ -96,10 +96,10 @@ ExportDialog::ExportDialog(QWidget* parent, const std::string& video_name)
   // -------- Resolution --------
   resolution_combo_ = new QComboBox(this);
   resolution_combo_->addItem(tr("Auto"), static_cast<int>(kResAuto));
-  resolution_combo_->addItem(tr("4K (3840x2160)"), static_cast<int>(kRes4k));
-  resolution_combo_->addItem(tr("2K (2560x1440)"), static_cast<int>(kRes2k));
-  resolution_combo_->addItem(tr("1080p (1920x1080)"), static_cast<int>(kRes1080p));
-  resolution_combo_->addItem(tr("720p (1280x720)"), static_cast<int>(kRes720p));
+  // resolution_combo_->addItem(tr("4K (3840x2160)"), static_cast<int>(kRes4k));
+  // resolution_combo_->addItem(tr("2K (2560x1440)"), static_cast<int>(kRes2k));
+  // resolution_combo_->addItem(tr("1080p (1920x1080)"), static_cast<int>(kRes1080p));
+  // resolution_combo_->addItem(tr("720p (1280x720)"), static_cast<int>(kRes720p));
   resolution_combo_->setCurrentIndex(0);
 
   // -------- Buttons --------
@@ -128,7 +128,7 @@ ExportParams ExportDialog::GetParams() {
   p.export_path = path.toStdString();
 
   const int bitrate_mbps = bitrate_edit_ ? bitrate_edit_->value() : 0;
-  p.export_bitrate = static_cast<double>(bitrate_mbps);
+  p.export_bitrate = static_cast<double>(bitrate_mbps) * 1000 * 1000;
 
   const int code = resolution_combo_ ? resolution_combo_->currentData().toInt() : 0;
   p.export_resolution = code;
@@ -143,7 +143,8 @@ void ExportDialog::SetParams(const ExportParams& params) {
 
   if (bitrate_edit_ != nullptr) {
     // Your param is double, UI is integer Mbps. We round to nearest int.
-    const int bitrate_mbps = static_cast<int>(std::lround(params.export_bitrate));
+    const double bitrate_mb = params.export_bitrate / (1024 * 1024);
+    const int bitrate_mbps = static_cast<int>(std::lround(bitrate_mb));
     const int clamped = std::clamp(bitrate_mbps, kMinBitrateMbps, kMaxBitrateMbps);
     bitrate_edit_->setValue(clamped);
   }

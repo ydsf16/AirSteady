@@ -15,6 +15,12 @@
   #include <limits.h>
 #endif
 
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#include <shlobj.h>
+#endif
+
+
 namespace airsteady {
 namespace fs = std::filesystem;
 
@@ -161,6 +167,31 @@ bool IsFolderExist(const std::string& folder_path) {
   const fs::path p(folder_path);
   if (!fs::exists(p, ec) || ec) return false;
   return fs::is_directory(p, ec) && !ec;
+}
+
+std::string GetDesktopPath() {
+    // Windows 系统
+#if defined(_WIN32) || defined(_WIN64)
+    PWSTR path = nullptr;
+    HRESULT hr = SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &path);
+    if (SUCCEEDED(hr)) {
+        std::wstring wpath(path);
+        CoTaskMemFree(path);
+        return std::string(wpath.begin(), wpath.end());  // 转换为 std::string
+    }
+    return "";
+#endif
+
+    // Linux 或 macOS 系统
+#if defined(__linux__) || defined(__APPLE__)
+    const char* homeDir = std::getenv("HOME");
+    if (homeDir) {
+        return std::string(homeDir) + "/Desktop";
+    }
+    return "";
+#endif
+
+    return "";
 }
 
 }  // namespace airsteady

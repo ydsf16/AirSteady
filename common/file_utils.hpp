@@ -25,4 +25,5 @@ bool IsFileExist(const std::string& file_path);
 
 bool IsFolderExist(const std::string& folder_path);
 
+std::string GetDesktopPath();
 }  // namespace airsteady

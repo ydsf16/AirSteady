@@ -202,17 +202,57 @@ void MainWindow::onOpenClicked() {
     [this]() {
       onPreviewDone();
     });
+  
+  // Export related.
+  video_processor_->AddExportCallback([this](int frame_idx) {
+      onExportCallback(frame_idx);
+    });
+  video_processor_->AddExportDoneCallback([this]() {
+      onExportDone();
+    });
 
   // Start tracking!!!
   video_processor_->StartTracking(&err);
 }
 
 void MainWindow::onExportClicked() {
-  ExportDialog dlg(this, "video_name.mp4");
+  if (video_processor_ == nullptr) {
+    QMessageBox::information(
+      this,
+      tr("失败"),
+      tr("请先打开视频"));
+    return;
+  }
+  if (video_processor_->status() != Processor::Status::kStabilized) {
+    return;
+  }
+
+  const std::string video_path = video_processor_->config().video_path;
+  std::string video_name;
+  GetVideoName(video_path, &video_name);
+  const VideoInfo video_info = video_processor_->GetVideoInfo();
+
+  // Initial export param.
+  ExportParams init_export_param = video_processor_->config().export_params;
+  init_export_param.export_path = GetDesktopPath() + "/" + video_name + "_airsteady.mp4";
+  init_export_param.export_bitrate = video_info.bitrate;
+  LOG(INFO) << "Export bitreate: " << video_info.bitrate;
+
+  ExportDialog dlg(this, video_name);
+  dlg.SetParams(init_export_param);
+
   if (dlg.exec() != QDialog::Accepted) {
     return;
   }
 
+  ExportParams set_params = dlg.GetParams();
+  LOG(INFO) << "set_export_path: "  << std::fixed 
+            << set_params.export_path 
+            << ", bitrate: "  << set_params.export_bitrate
+            << ", export_resolution: " << set_params.export_resolution; 
+
+  video_processor_->SetExportParams(set_params);
+  video_processor_->StartExport();
 }
 
 void MainWindow::onPlayPauseClicked() {
@@ -327,6 +367,16 @@ void MainWindow::onTimelineSliderValueChanged(int value) {
     video_processor_->SeekAndPreviewOnce(frame_idx);
   }
 } 
+
+void MainWindow::onExportCallback(int frame_idx) {
+  auto video_info = video_processor_->GetVideoInfo();
+  double progress_ratio = static_cast<double>(frame_idx) / video_info.num_frames;
+  steady_view_->UpdateProgressBar(progress_ratio);
+}
+
+void MainWindow::onExportDone() {
+  steady_view_->ClearProgressBar();
+}
 
 void MainWindow::OnReceiveTrackingResult(const FrameTrackingResultPreview& track_preview) {
   // Copy only what we need (Mat lifetime: VideoView will deep copy; here we pass by value in lambda).

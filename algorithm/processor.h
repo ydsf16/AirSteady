@@ -13,6 +13,7 @@
 #include "algorithm/tracker.h"
 #include "algorithm/stabilizer.h"
 #include "algorithm/previewer.h"
+#include "algorithm/video_exportor.h"
 
 namespace airsteady {
 
@@ -40,7 +41,7 @@ class Processor {
   using TrackFinishedCallback = std::function<void()>;
   using StableFinishedCallback = std::function<void()>;
   using PreviewCallback = std::function<void(const FramePreview& frame_preview)>;
-  using ExportProgressCallback = std::function<void(double progress_ratio)>;
+  using ExportProgressCallback = std::function<void(int frame_idx)>;
 
  public:
   // Construct from configuration, used when user clicks "Open Video".
@@ -91,8 +92,10 @@ class Processor {
   void AddPreviewDoneCallback(std::function<void()> cb);
 
   // ---------------- Export ----------------
-  bool StartExport(std::string* err);
-  bool AddExportCallback(ExportProgressCallback cb);
+  void SetExportParams(const ExportParams& export_params);
+  void StartExport();
+  void AddExportCallback(ExportProgressCallback cb);
+  void AddExportDoneCallback(std::function<void()> cb);
 
   // ---------------- Persistence ----------------
   bool Save(const std::string& work_folder);
@@ -129,6 +132,7 @@ private:
   std::shared_ptr<Tracker> tracker_;
   std::shared_ptr<Stabilizer> stabilizer_;
   std::shared_ptr<Previewer> previewer_;
+  std::shared_ptr<VideoExportor> video_exportor_;
 };
 
 }  // namespace airsteady

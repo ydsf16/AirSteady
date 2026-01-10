@@ -46,6 +46,10 @@ class VideoView : public QWidget {
                       const QColor& color = QColor(255, 180, 0));
   void ClearWarnOverlay();
 
+  // 导出 / 长任务进度条接口：ratio ∈ [0,1]
+  void UpdateProgressBar(double ratio);
+  void ClearProgressBar();
+
  signals:
   // Optional: if you later want click-to-select ROI, emit normalized rect.
   void TargetRectSelected(const QRectF& rect_norm);  // 0~1 in image coords
@@ -136,6 +140,10 @@ class VideoView : public QWidget {
 
   // For click handling / debugging
   QRectF last_draw_rect_;
+
+  // Progress bar state.
+  bool has_progress_bar_ = false;
+  double progress_ratio_ = 0.0;  // [0,1]
 };
 
 }  // namespace airsteady

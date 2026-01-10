@@ -58,6 +58,10 @@ class MainWindow : public QMainWindow {
 
   void onTimelineSliderValueChanged(int value);
 
+  // Export.
+  void onExportCallback(int frame_idx);
+  void onExportDone();
+
  private:
   void buildUi();
 

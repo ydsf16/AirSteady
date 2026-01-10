@@ -50,8 +50,8 @@ struct StabilizerConfig {
   int timing_log_every_irls_iter = 1;  // 1 = every iter
 
   // Step-1 (object centers) base sigmas (pixel-domain).
-  double global_sigma_px = 1000000000.0;            // when global_center_valid
-  double weak_center_sigma_px = 20000000.0;     // when global invalid, weak pull to image center
+  double global_sigma_px = 50.0;            // when global_center_valid
+  double weak_center_sigma_px = 2000.0;     // when global invalid, weak pull to image center
   double odom_sigma_px = 1.0;              // when delta_valid but delta_noise absent
   double odom_invalid_sigma_px = 80.0;     // when delta invalid, weak equality
 

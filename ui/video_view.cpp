@@ -127,6 +127,25 @@ void VideoView::ClearWarnOverlay() {
   RequestRepaintAsync();
 }
 
+// Progress bar APIs.
+void VideoView::UpdateProgressBar(double ratio) {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    progress_ratio_ = Clamp(ratio, 0.0, 1.0);
+    has_progress_bar_ = true;
+  }
+  RequestRepaintAsync();
+}
+
+void VideoView::ClearProgressBar() {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    has_progress_bar_ = false;
+    progress_ratio_ = 0.0;
+  }
+  RequestRepaintAsync();
+}
+
 void VideoView::RequestRepaintAsync() {
   // Ensure repaint request happens on UI thread even if setters are called from workers.
   QMetaObject::invokeMethod(this, [this]() { this->update(); }, Qt::QueuedConnection);
@@ -283,6 +302,9 @@ void VideoView::PaintTitleAndOverlays(QPainter* painter, const QRectF& draw_rect
   QColor warn_color;
   bool has_warn = false;
 
+  bool has_progress = false;
+  double progress_ratio = 0.0;
+
   {
     std::lock_guard<std::mutex> lk(mu_);
     overlay_text = overlay_text_;
@@ -293,6 +315,9 @@ void VideoView::PaintTitleAndOverlays(QPainter* painter, const QRectF& draw_rect
     warn_text = warn_overlay_text_;
     warn_color = warn_overlay_color_;
     has_warn = has_warn_overlay_;
+
+    has_progress = has_progress_bar_;
+    progress_ratio = progress_ratio_;
   }
 
   if (has_overlay) {
@@ -326,6 +351,58 @@ void VideoView::PaintTitleAndOverlays(QPainter* painter, const QRectF& draw_rect
              draw_rect.width() - 20, 40);
     painter->fillRect(r.adjusted(-6, -4, 6, 4), QColor(0, 0, 0, 160));
     painter->drawText(r, Qt::AlignLeft | Qt::AlignVCenter, warn_text);
+  }
+
+  // 中间大号导出进度条
+  if (has_progress) {
+    painter->save();
+
+    const double r = Clamp(progress_ratio, 0.0, 1.0);
+    const double bar_width = draw_rect.width() * 0.6;   // 占画面宽度 60%
+    const int    bar_height = 12;                       // 稍微厚一点
+    const int    padding = 12;
+
+    // 进度条居中放在画面中间（稍微偏下一点）
+    QPointF center = draw_rect.center();
+    QRectF bar_bg(center.x() - bar_width * 0.5,
+                  center.y() - bar_height * 0.5 + 10,
+                  bar_width,
+                  bar_height);
+
+    // 包含文字+进度条的面板区域
+    QRectF panel = bar_bg.adjusted(-padding,
+                                   -padding - 22,   // 上方留文字高度
+                                   padding,
+                                   padding);
+
+    // 背景面板
+    painter->setPen(Qt::NoPen);
+    painter->setBrush(QColor(0, 0, 0, 190));
+    painter->drawRoundedRect(panel, 8, 8);
+
+    // 进度条背景
+    painter->setBrush(QColor(60, 60, 60, 220));
+    painter->drawRect(bar_bg);
+
+    // 进度条前景
+    QRectF bar_fg = bar_bg;
+    bar_fg.setWidth(bar_bg.width() * r);
+    painter->setBrush(QColor(0, 180, 255, 255));
+    painter->drawRect(bar_fg);
+
+    // 文本「正在导出 xx%」
+    painter->setPen(QColor(255, 255, 255));
+    QFont f = painter->font();
+    f.setBold(true);
+    painter->setFont(f);
+
+    int percent = static_cast<int>(std::round(r * 100.0));
+    QString text = QStringLiteral("正在导出 %1%").arg(percent);
+
+    QRectF text_rect(panel.x(), panel.y() + 2, panel.width(), 20);
+    painter->drawText(text_rect, Qt::AlignHCenter | Qt::AlignVCenter, text);
+
+    painter->restore();
   }
 
   painter->restore();
@@ -412,7 +489,7 @@ void VideoView::PaintStabilizedView(QPainter* painter, const QRectF& draw_rect,
   const double tx = -shift_px.x() * sx;
   const double ty = -shift_px.y() * sy;
 
-  // --------- 1) draw to screen (existing behavior) ----------
+  // 1) draw to screen (existing behavior)
   painter->save();
   painter->setClipRect(draw_rect);
   painter->translate(tx, ty);
@@ -428,11 +505,9 @@ void VideoView::PaintStabilizedView(QPainter* painter, const QRectF& draw_rect,
   painter->fillRect(tr.adjusted(-6, -3, 6, 3), QColor(0, 0, 0, 140));
   painter->drawText(tr, Qt::AlignLeft | Qt::AlignVCenter, s);
 
-  // --------- 2) debug record: offscreen render + VideoWriter (static) ----------
-  // Toggle by environment variable to avoid touching UI plumbing:
+  // 2) debug record: offscreen render + VideoWriter (static)
+  // Toggle by environment variable if needed:
   //   AIRSTEADY_STABLE_REC=1
-  // Output:
-  //   ./stable_debug.mp4   (relative to working dir)
   static bool s_enabled = true;
   static bool s_inited = false;
   static cv::VideoWriter s_writer;
@@ -466,7 +541,6 @@ void VideoView::PaintStabilizedView(QPainter* painter, const QRectF& draw_rect,
   }
 
   if (s_enabled && s_writer.isOpened()) {
-    // If user resizes the widget mid-run, stop to avoid broken stream.
     const QSize widget_size = this->size();
     if (widget_size.width() != s_w || widget_size.height() != s_h) {
       LOG(WARNING) << "[VideoView][StableRec] Widget resized, stop recording. "
@@ -482,8 +556,7 @@ void VideoView::PaintStabilizedView(QPainter* painter, const QRectF& draw_rect,
       QPainter p2(&canvas);
       p2.setRenderHint(QPainter::Antialiasing, true);
 
-      // Re-render the stabilized view into canvas (same logic, but using p2)
-      // NOTE: draw_rect is in widget coords already.
+      // Re-render stabilized view into canvas (same logic, using p2).
       p2.fillRect(draw_rect, QColor(0, 0, 0));
 
       p2.save();
@@ -508,8 +581,6 @@ void VideoView::PaintStabilizedView(QPainter* painter, const QRectF& draw_rect,
       s_writer.write(bgr);
       ++s_frame_count;
 
-      // Optional: auto-stop after N frames to avoid huge files.
-      // if (s_frame_count >= 300) { s_writer.release(); s_enabled = false; }
       if ((s_frame_count % 60) == 0) {
         LOG(INFO) << "[VideoView][StableRec] wrote frames=" << s_frame_count;
       }
@@ -563,7 +634,8 @@ void VideoView::paintEvent(QPaintEvent* /*event*/) {
   // Base image
   if (mode == RenderMode::kPreviewRight && has_stable) {
     // Right preview: stabilized render by translation onto canvas.
-    const Eigen::Vector2d shift = global_offset + Eigen::Vector2d(stable_res.delta_x, stable_res.delta_y);
+    const Eigen::Vector2d shift =
+        global_offset + Eigen::Vector2d(stable_res.delta_x, stable_res.delta_y);
     PaintStabilizedView(&painter, draw_rect, img, shift);
   } else {
     // Tracking / Left preview: draw raw frame fit to view.
@@ -574,13 +646,11 @@ void VideoView::paintEvent(QPaintEvent* /*event*/) {
     }
   }
 
-  // Title + overlays always on top
+  // Title + overlays + progress bar always on top
   PaintTitleAndOverlays(&painter, draw_rect);
 }
 
 void VideoView::mousePressEvent(QMouseEvent* event) {
-  // Optional: Click-to-select behavior can be expanded later.
-  // Currently: emit normalized point rect (tiny) so upstream can decide.
   if (event == nullptr) return;
 
   QRectF draw_rect;
