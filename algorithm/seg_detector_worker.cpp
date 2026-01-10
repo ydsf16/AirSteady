@@ -352,6 +352,8 @@ void SegDetectorWorker::SelectObjectAndExtractGftt(
   } else {
     // 没有 seg mask，则全 bbox 区域允许提点。
     gftt_mask = cv::Mat(roi_box.size(), CV_8UC1, cv::Scalar(255));
+    LOG(INFO) << "No mask here!!!";
+    return;
   }
 
   // ---------------- 5. GFTT ----------------
@@ -370,13 +372,13 @@ void SegDetectorWorker::SelectObjectAndExtractGftt(
 
   const auto t_gftt_begin = Clock::now();
   cv::goodFeaturesToTrack(
-      gray_roi, pts_local, max_corners,
-      /*qualityLevel=*/0.01,
-      /*minDistance=*/5.0,
-      /*mask=*/gftt_mask,
-      /*blockSize=*/3,
-      /*useHarrisDetector=*/false,
-      /*k=*/0.04);
+      gray_roi, 
+      pts_local, 
+      max_corners,
+      /*qualityLevel=*/0.001,
+      /*minDistance=*/2.0,
+      /*mask=*/gftt_mask);
+
   const auto t_gftt_end = Clock::now();
   timing.gftt_ms = MsSince(t_gftt_begin, t_gftt_end);
 

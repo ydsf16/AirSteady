@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
+
+#include <glog/logging.h>
 
 namespace airsteady {
 
@@ -18,6 +21,21 @@ int ClampFrameIndex(int idx, int total_frames) {
     return total_frames - 1;
   }
   return idx;
+}
+
+// OpenCV CAP_PROP_POS_FRAMES is often "next frame index" after a read().
+// So after a successful read(), we use (pos - 1) as the decoded frame index.
+// This is backend-dependent, so we clamp and also keep a fallback.
+int DecodedFrameIndexAfterRead(cv::VideoCapture& cap,
+                              int total_frames,
+                              int fallback_idx) {
+  double pos = cap.get(cv::CAP_PROP_POS_FRAMES);
+  if (!std::isfinite(pos)) {
+    return ClampFrameIndex(fallback_idx, total_frames);
+  }
+  int idx = static_cast<int>(pos + 0.5) - 1;
+  if (idx < 0) idx = fallback_idx;
+  return ClampFrameIndex(idx, total_frames);
 }
 
 }  // namespace
@@ -60,11 +78,15 @@ bool Previewer::Init(std::string* err_msg) {
   }
 
   fps_ = cap_.get(cv::CAP_PROP_FPS);
-  if (fps_ <= 0.0) {
+  if (fps_ <= 0.0 || !std::isfinite(fps_)) {
     // Fallback: treat as 30fps if metadata is broken.
     fps_ = 30.0;
   }
+
+  // NOTE: CAP_PROP_FRAME_COUNT can be unreliable for some containers/VFR.
+  // We still use it as an upper bound for clamping UI seeks.
   total_frames_ = static_cast<int>(cap_.get(cv::CAP_PROP_FRAME_COUNT) + 0.5);
+  if (total_frames_ < 0) total_frames_ = 0;
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -96,6 +118,12 @@ void Previewer::SetTrackResults(
   for (const auto& r : stable_results) {
     frame_idx_stable_results_[r.frame_idx] = r;
   }
+
+  // NOTE:
+  // We intentionally do NOT CHECK equality between:
+  // - total_frames_ (from container metadata)
+  // - result sizes (from our pipeline)
+  // because CAP_PROP_FRAME_COUNT can be unreliable (VFR, certain demuxers).
 }
 
 bool Previewer::StartPreview() {
@@ -104,12 +132,15 @@ bool Previewer::StartPreview() {
     return false;
   }
 
-  // If already at the end, rewind to the beginning.
+  // If already at (or beyond) the end, rewind to the beginning.
   if (total_frames_ > 0 && current_frame_idx_ >= total_frames_) {
     seek_pending_ = true;
     seek_frame_idx_ = 0;
+  } else if (total_frames_ <= 0) {
+    // If total_frames_ unknown, allow play; decoding will stop on read() failure.
   }
 
+  // If result sizes mismatch, we still allow preview; overlay lookup is by frame_idx key.
   playing_ = true;
   cond_var_.notify_all();
   return true;
@@ -159,6 +190,11 @@ void Previewer::AddPreviewCallback(PreviewCallback cb) {
   callbacks_.push_back(std::move(cb));
 }
 
+void Previewer::AddPreviewDoneCallback(std::function<void()> cb) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  preview_done_cb_ = cb;
+}
+
 FramePreview Previewer::MakeFramePreviewLocked(const cv::Mat& frame,
                                                int frame_idx) const {
   FramePreview preview;
@@ -170,7 +206,6 @@ FramePreview Previewer::MakeFramePreviewLocked(const cv::Mat& frame,
   } else {
     preview.time_ns = 0;
   }
-
   // Clone to ensure lifetime beyond this function.
   preview.proxy_bgr = frame.clone();
 
@@ -179,7 +214,10 @@ FramePreview Previewer::MakeFramePreviewLocked(const cv::Mat& frame,
     preview.track_res = track_it->second;
     if (preview.time_ns == 0) {
       preview.time_ns = track_it->second.time_ns;
+      
     }
+  } else {
+    LOG(FATAL) << "MUST NOT BE ERE" << frame_idx;
   }
 
   const auto stable_it = frame_idx_stable_results_.find(frame_idx);
@@ -187,7 +225,10 @@ FramePreview Previewer::MakeFramePreviewLocked(const cv::Mat& frame,
     preview.stable_res = stable_it->second;
     if (preview.time_ns == 0) {
       preview.time_ns = stable_it->second.time_ns;
+      
     }
+  } else {
+    LOG(FATAL) << "MUST NOT BE ERE" << frame_idx;
   }
 
   return preview;
@@ -229,6 +270,7 @@ void Previewer::Run() {
         local_playing = playing_;
 
         if (local_seek_pending && cap_.isOpened()) {
+          // Best-effort seek. Some backends seek to nearest keyframe.
           cap_.set(cv::CAP_PROP_POS_FRAMES, local_seek_frame_idx);
           current_frame_idx_ = local_seek_frame_idx;
           seek_pending_ = false;
@@ -256,12 +298,17 @@ void Previewer::Run() {
         continue;
       }
 
+      // IMPORTANT: derive decoded index from cap_ after read(), do not trust requested index.
+      const int decoded_idx = DecodedFrameIndexAfterRead(cap_, total_frames_, single_idx);
+
       FramePreview preview;
       {
         std::lock_guard<std::mutex> lock(mutex_);
-        preview = MakeFramePreviewLocked(frame, single_idx);
+        preview = MakeFramePreviewLocked(frame, decoded_idx);
         single_preview_ = preview;
-        current_frame_idx_ = single_idx;
+
+        // Set next expected to decoded_idx + 1, so StartPreview continues correctly.
+        current_frame_idx_ = decoded_idx + 1;
       }
 
       std::vector<PreviewCallback> callbacks_copy;
@@ -282,9 +329,9 @@ void Previewer::Run() {
       }
       single_preview_cv_.notify_all();
 
-      // Reset decode position to this frame so next StartPreview continues here.
-      cap_.set(cv::CAP_PROP_POS_FRAMES, single_idx);
-
+      // Reset decode position to decoded frame so next StartPreview continues near here.
+      cap_.set(cv::CAP_PROP_POS_FRAMES, decoded_idx + 1);
+    
       continue;
     }
 
@@ -294,13 +341,32 @@ void Previewer::Run() {
     if (!cap_.read(frame) || frame.empty()) {
       std::lock_guard<std::mutex> lock(mutex_);
       playing_ = false;
+
+      cap_.release();
+      cap_.open(proxy_bgr_path_);
+      cap_.set(cv::CAP_PROP_POS_FRAMES, 0);
+      if (cap_.read(frame) && !frame.empty()) {
+        running_ = true;
+        playing_ = false;
+        seek_pending_ = false;
+        single_preview_pending_ = false;
+        single_preview_ready_ = false;
+        current_frame_idx_ = 0;
+      }
+      if (preview_done_cb_) {
+        preview_done_cb_();
+      }
+
       continue;
     }
+
+    // IMPORTANT: derive decoded index from cap_ after read(), do not trust local_frame_idx.
+    const int decoded_idx = DecodedFrameIndexAfterRead(cap_, total_frames_, local_frame_idx);
 
     FramePreview preview;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      preview = MakeFramePreviewLocked(frame, local_frame_idx);
+      preview = MakeFramePreviewLocked(frame, decoded_idx);
     }
 
     std::vector<PreviewCallback> callbacks_copy;
@@ -317,7 +383,14 @@ void Previewer::Run() {
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      ++current_frame_idx_;
+      // Next expected frame index tracks what we actually decoded.
+      current_frame_idx_ = decoded_idx + 1;
+      if (total_frames_ > 0) {
+        // Clamp to avoid growing unbounded if metadata is slightly off.
+        if (current_frame_idx_ > total_frames_) {
+          current_frame_idx_ = total_frames_;
+        }
+      }
     }
 
     // Control frame pacing: subtract decode + callback time.

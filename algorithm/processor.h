@@ -88,6 +88,7 @@ class Processor {
   void SeekPreview(int frame_idx);
   void SeekAndPreviewOnce(int frame_idx);
   void AddPreviewCallback(PreviewCallback cb);
+  void AddPreviewDoneCallback(std::function<void()> cb);
 
   // ---------------- Export ----------------
   bool StartExport(std::string* err);

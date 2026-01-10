@@ -138,6 +138,8 @@ void MainWindow::buildUi() {
           this, &MainWindow::onSmoothChanged);
   connect(control_panel_, &ControlPanel::cropKeepRatioChanged,
           this, &MainWindow::onCropKeeRatioChanged);
+
+  connect(timeline_slider_, &QSlider::valueChanged, this, &MainWindow::onTimelineSliderValueChanged);
 }
 
 void MainWindow::onOpenClicked() {
@@ -195,6 +197,11 @@ void MainWindow::onOpenClicked() {
     [this](const FramePreview& res) {
       onReceivePreviewResult(res);
     });
+  
+  video_processor_->AddPreviewDoneCallback(
+    [this]() {
+      onPreviewDone();
+    });
 
   // Start tracking!!!
   video_processor_->StartTracking(&err);
@@ -209,8 +216,9 @@ void MainWindow::onExportClicked() {
 }
 
 void MainWindow::onPlayPauseClicked() {
-  LOG(INFO) << "onPlayPauseClicked: "
-            << ", " << (int)(video_processor_->status());
+  if (!video_processor_) {return; }
+
+  LOG(INFO) << "onPlayPauseClicked: " << ", " << (int)(video_processor_->status());
   if (video_processor_->status() != Processor::Status::kStabilized) {
     return;
   }
@@ -291,13 +299,40 @@ void MainWindow::OnTrackFinished() {
 }
 
 void MainWindow::OnStablePlaneFinished() {
-
 }
+
+void MainWindow::onPreviewDone() {
+  LOG(WARNING) << "onPreviewDone";
+
+  // video_processor_->SeekAndPreviewOnce(0);
+  // video_processor_->HoldPreview();
+
+  LOG(INFO) << "Stop preview";
+  preview_is_run_ = false;
+  play_btn_->setText(QStringLiteral("▶"));
+}
+
+void MainWindow::onTimelineSliderValueChanged(int value) {
+  if (!video_processor_) {return; }
+
+  if (video_processor_->status() != Processor::Status::kStabilized) {
+    return;
+  }
+  if (preview_is_run_ == true) {
+    return;
+  }
+
+  int frame_idx = timeline_slider_->value();
+  if (frame_idx % 5 == 0) {
+    video_processor_->SeekAndPreviewOnce(frame_idx);
+  }
+} 
 
 void MainWindow::OnReceiveTrackingResult(const FrameTrackingResultPreview& track_preview) {
   // Copy only what we need (Mat lifetime: VideoView will deep copy; here we pass by value in lambda).
   const FrameTrackingResultPreview preview_copy = track_preview;
-  raw_view_->SetTrackFrame(track_preview);
+
+  // raw_view_->SetTrackFrame(preview_copy);
 
   QMetaObject::invokeMethod(this, [this, preview_copy]() {
     if (!video_processor_) {
@@ -312,7 +347,7 @@ void MainWindow::OnReceiveTrackingResult(const FrameTrackingResultPreview& track
       return;
     }
 
-    // raw_view_->SetTrackFrame(preview_copy);
+    raw_view_->SetTrackFrame(preview_copy);
 
     const VideoInfo video_info = video_processor_->GetVideoInfo();
     const int total = std::max(0, static_cast<int>(video_info.num_frames));
@@ -354,29 +389,39 @@ static QString FormatFrameProgress(int idx, int total) {
 }
 
 void MainWindow::onReceivePreviewResult(const FramePreview& frame_preview) {
-  LOG(INFO) << "Receive frame_preview: " << frame_preview.frame_idx;
-
   QPointer<MainWindow> self(this);
   FramePreview preview_copy = frame_preview;  // 若包含 Mat 且复用缓冲，同理可 clone
 
   QMetaObject::invokeMethod(
       this,
-      [self, preview = std::move(preview_copy)]() mutable {
-        if (!self) return;
-        if (!self->video_processor_) return;
+      [this, preview = std::move(preview_copy)]() mutable {
+        if (!video_processor_) return;
 
-        if (self->raw_view_) {
-          LOG(INFO) << "Set view frame to left: " << preview.frame_idx << preview.proxy_bgr.size();
-          self->raw_view_->SetPreviewFrame(preview, Eigen::Vector2d::Zero(), true);
-          
-          LOG(INFO) << "raw_view visible=" << self->raw_view_->isVisible()
-            << " size=" << self->raw_view_->width() << "x" << self->raw_view_->height();
-
-          // cv::imshow("x", preview.proxy_bgr);
-          // cv::waitKey(1);
+        if (raw_view_) {
+          raw_view_->SetPreviewFrame(preview, Eigen::Vector2d::Zero(), true);
         }
-        if (self->steady_view_) {
-          self->steady_view_->SetPreviewFrame(preview, Eigen::Vector2d::Zero(), false);
+        if (steady_view_) {
+          steady_view_->SetPreviewFrame(preview, Eigen::Vector2d::Zero(), false);
+        }
+
+        const VideoInfo video_info = video_processor_->GetVideoInfo();
+        const int total = std::max(0, static_cast<int>(video_info.num_frames));
+        const int idx = preview.frame_idx;
+
+        if (timeline_slider_) {
+          const int max_idx = std::max(0, total - 1);
+          timeline_slider_->setRange(0, max_idx);
+          timeline_slider_->setValue(std::clamp(idx, 0, max_idx));
+        }
+
+        if (time_label_) {
+          double ratio = 0.0;
+          if (total > 0) ratio = static_cast<double>(idx) / static_cast<double>(total);
+
+          std::ostringstream ss;
+          ss << "frame " << idx << "/" << std::max(0, total - 1)
+            << " (" << std::fixed << std::setprecision(1) << (ratio * 100.0) << "%)";
+          time_label_->setText(QString::fromStdString(ss.str()));
         }
       },
       Qt::QueuedConnection);

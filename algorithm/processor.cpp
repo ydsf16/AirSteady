@@ -121,6 +121,10 @@ void Processor::AddPreviewCallback(PreviewCallback cb) {
   previewer_->AddPreviewCallback(cb);
 }
 
+void Processor::AddPreviewDoneCallback(std::function<void()> cb) {
+  previewer_->AddPreviewDoneCallback(cb);
+}
+
 bool Processor::StartExport(std::string* err) {
   (void)err;
   return false;

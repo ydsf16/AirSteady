@@ -54,6 +54,10 @@ class MainWindow : public QMainWindow {
   void OnTrackFinished();
   void OnStablePlaneFinished();
 
+  void onPreviewDone();
+
+  void onTimelineSliderValueChanged(int value);
+
  private:
   void buildUi();
 

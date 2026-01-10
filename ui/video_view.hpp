@@ -6,6 +6,8 @@
 #include <QRectF>
 #include <QString>
 
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <vector>

@@ -78,305 +78,332 @@ class ProxyVideoWriter {
   ProxyVideoWriter() = default;
   ~ProxyVideoWriter() { Close(); }
 
-  void Open(const std::string& path, int w, int h, double fps);
-  void Write(const cv::Mat& bgr);
-  void Close();
+  void Open(const std::string& path, int w, int h, double fps) {
+    video_writer_ = cv::VideoWriter(path, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), fps, cv::Size(w, h));
+    if (!video_writer_.isOpened()) {
+      throw std::runtime_error("Failed to open video file for writing.");
+    }
+  }
+  void Write(const cv::Mat& bgr) {
+    if (!video_writer_.isOpened()) {
+      throw std::runtime_error("Video writer is not opened.");
+    }
+    video_writer_.write(bgr); 
+  }
+  void Close() {
+    if (video_writer_.isOpened()) {
+      video_writer_.release();
+    }
+  }
 
  private:
-  AVFormatContext* fmt_ = nullptr;
-  AVCodecContext* enc_ctx_ = nullptr;
-  AVStream* stream_ = nullptr;
-
-  SwsContext* sws_ = nullptr;
-  AVFrame* frame_ = nullptr;
-  AVPacket* pkt_ = nullptr;
-
-  std::string encoder_name_;
-  int frame_idx_ = 0;
+  cv::VideoWriter video_writer_;
 };
 
-void ProxyVideoWriter::Open(const std::string& path, int w, int h, double fps) {
-  LOG(INFO) << "[ProxyVideoWriter] Open: path=" << path
-            << " size=" << w << "x" << h << " fps=" << fps;
+// class ProxyVideoWriter {
+//  public:
+//   ProxyVideoWriter() = default;
+//   ~ProxyVideoWriter() { Close(); }
 
-  if (fps <= 0.0) {
-    LOG(WARNING) << "[ProxyVideoWriter] fps <= 0, fallback to 30";
-    fps = 30.0;
-  }
+//   void Open(const std::string& path, int w, int h, double fps);
+//   void Write(const cv::Mat& bgr);
+//   void Close();
 
-  int ret = avformat_alloc_output_context2(&fmt_, nullptr, nullptr, path.c_str());
-  if (ret < 0 || !fmt_) {
-    LOG(ERROR) << "[ProxyVideoWriter] avformat_alloc_output_context2 failed: " << AvErr2Str(ret);
-    throw std::runtime_error("avformat_alloc_output_context2 failed: " + AvErr2Str(ret));
-  }
+//  private:
+//   AVFormatContext* fmt_ = nullptr;
+//   AVCodecContext* enc_ctx_ = nullptr;
+//   AVStream* stream_ = nullptr;
 
-  stream_ = avformat_new_stream(fmt_, nullptr);
-  if (!stream_) {
-    LOG(ERROR) << "[ProxyVideoWriter] avformat_new_stream failed";
-    throw std::runtime_error("avformat_new_stream failed");
-  }
+//   SwsContext* sws_ = nullptr;
+//   AVFrame* frame_ = nullptr;
+//   AVPacket* pkt_ = nullptr;
 
-  AVRational time_base{1, static_cast<int>(fps + 0.5)};
-  if (time_base.den <= 0) time_base.den = 30;
+//   std::string encoder_name_;
+//   int frame_idx_ = 0;
+// };
 
-  enc_ctx_ = avcodec_alloc_context3(nullptr);
-  if (!enc_ctx_) {
-    LOG(ERROR) << "[ProxyVideoWriter] avcodec_alloc_context3 failed";
-    throw std::runtime_error("avcodec_alloc_context3 failed");
-  }
-  enc_ctx_->width = w;
-  enc_ctx_->height = h;
-  enc_ctx_->time_base = time_base;
-  enc_ctx_->framerate = AVRational{time_base.den, time_base.num};
-  enc_ctx_->gop_size = 60;
-  enc_ctx_->max_b_frames = 0;
-  enc_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
+// void ProxyVideoWriter::Open(const std::string& path, int w, int h, double fps) {
+//   LOG(INFO) << "[ProxyVideoWriter] Open: path=" << path
+//             << " size=" << w << "x" << h << " fps=" << fps;
 
-  if (fmt_->oformat->flags & AVFMT_GLOBALHEADER) {
-    enc_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-  }
+//   if (fps <= 0.0) {
+//     LOG(WARNING) << "[ProxyVideoWriter] fps <= 0, fallback to 30";
+//     fps = 30.0;
+//   }
 
-  const std::vector<const char*> enc_names = {
-      "h264_nvenc",
-      "h264_qsv",
-      "h264_amf",
-      "h264_mf",
-      "libx264",
-      "h264",
-      "mpeg4",
-  };
+//   int ret = avformat_alloc_output_context2(&fmt_, nullptr, nullptr, path.c_str());
+//   if (ret < 0 || !fmt_) {
+//     LOG(ERROR) << "[ProxyVideoWriter] avformat_alloc_output_context2 failed: " << AvErr2Str(ret);
+//     throw std::runtime_error("avformat_alloc_output_context2 failed: " + AvErr2Str(ret));
+//   }
 
-  bool opened = false;
-  for (const char* name : enc_names) {
-    const AVCodec* codec = avcodec_find_encoder_by_name(name);
-    if (!codec) {
-      LOG(INFO) << "[ProxyVideoWriter] Encoder not found: " << name;
-      continue;
-    }
+//   stream_ = avformat_new_stream(fmt_, nullptr);
+//   if (!stream_) {
+//     LOG(ERROR) << "[ProxyVideoWriter] avformat_new_stream failed";
+//     throw std::runtime_error("avformat_new_stream failed");
+//   }
 
-    avcodec_free_context(&enc_ctx_);
-    enc_ctx_ = avcodec_alloc_context3(codec);
-    if (!enc_ctx_) {
-      LOG(ERROR) << "[ProxyVideoWriter] avcodec_alloc_context3 failed for " << name;
-      continue;
-    }
+//   AVRational time_base{1, static_cast<int>(fps + 0.5)};
+//   if (time_base.den <= 0) time_base.den = 30;
 
-    enc_ctx_->width = w;
-    enc_ctx_->height = h;
-    enc_ctx_->time_base = time_base;
-    enc_ctx_->framerate = AVRational{time_base.den, time_base.num};
-    enc_ctx_->gop_size = 60;
-    enc_ctx_->max_b_frames = 0;
+//   enc_ctx_ = avcodec_alloc_context3(nullptr);
+//   if (!enc_ctx_) {
+//     LOG(ERROR) << "[ProxyVideoWriter] avcodec_alloc_context3 failed";
+//     throw std::runtime_error("avcodec_alloc_context3 failed");
+//   }
+//   enc_ctx_->width = w;
+//   enc_ctx_->height = h;
+//   enc_ctx_->time_base = time_base;
+//   enc_ctx_->framerate = AVRational{time_base.den, time_base.num};
+//   enc_ctx_->gop_size = 60;
+//   enc_ctx_->max_b_frames = 0;
+//   enc_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
 
-    enc_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
-    if (codec->pix_fmts) {
-      enc_ctx_->pix_fmt = codec->pix_fmts[0];
-      for (const AVPixelFormat* pf = codec->pix_fmts; *pf != AV_PIX_FMT_NONE; ++pf) {
-        if (*pf == AV_PIX_FMT_YUV420P) {
-          enc_ctx_->pix_fmt = *pf;
-          break;
-        }
-      }
-    }
+//   if (fmt_->oformat->flags & AVFMT_GLOBALHEADER) {
+//     enc_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+//   }
 
-    if (fmt_->oformat->flags & AVFMT_GLOBALHEADER) {
-      enc_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-    }
+//   const std::vector<const char*> enc_names = {
+//       "h264_nvenc",
+//       "h264_qsv",
+//       "h264_amf",
+//       "h264_mf",
+//       "libx264",
+//       "h264",
+//       "mpeg4",
+//   };
 
-    ret = avcodec_open2(enc_ctx_, codec, nullptr);
-    if (ret < 0) {
-      LOG(WARNING) << "[ProxyVideoWriter] avcodec_open2 failed for encoder "
-                   << name << ": " << AvErr2Str(ret);
-      avcodec_free_context(&enc_ctx_);
-      continue;
-    }
+//   bool opened = false;
+//   for (const char* name : enc_names) {
+//     const AVCodec* codec = avcodec_find_encoder_by_name(name);
+//     if (!codec) {
+//       LOG(INFO) << "[ProxyVideoWriter] Encoder not found: " << name;
+//       continue;
+//     }
 
-    encoder_name_ = codec->name ? codec->name : "unknown";
-    LOG(INFO) << "[ProxyVideoWriter] Selected encoder: " << encoder_name_;
-    opened = true;
-    break;
-  }
+//     avcodec_free_context(&enc_ctx_);
+//     enc_ctx_ = avcodec_alloc_context3(codec);
+//     if (!enc_ctx_) {
+//       LOG(ERROR) << "[ProxyVideoWriter] avcodec_alloc_context3 failed for " << name;
+//       continue;
+//     }
 
-  if (!opened) {
-    throw std::runtime_error("No usable encoder found (tried hw encoders + libx264/h264/mpeg4).");
-  }
+//     enc_ctx_->width = w;
+//     enc_ctx_->height = h;
+//     enc_ctx_->time_base = time_base;
+//     enc_ctx_->framerate = AVRational{time_base.den, time_base.num};
+//     enc_ctx_->gop_size = 60;
+//     enc_ctx_->max_b_frames = 0;
 
-  stream_->time_base = enc_ctx_->time_base;
-  ret = avcodec_parameters_from_context(stream_->codecpar, enc_ctx_);
-  if (ret < 0) {
-    LOG(ERROR) << "[ProxyVideoWriter] avcodec_parameters_from_context failed: " << AvErr2Str(ret);
-    throw std::runtime_error("avcodec_parameters_from_context failed: " + AvErr2Str(ret));
-  }
+//     enc_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
+//     if (codec->pix_fmts) {
+//       enc_ctx_->pix_fmt = codec->pix_fmts[0];
+//       for (const AVPixelFormat* pf = codec->pix_fmts; *pf != AV_PIX_FMT_NONE; ++pf) {
+//         if (*pf == AV_PIX_FMT_YUV420P) {
+//           enc_ctx_->pix_fmt = *pf;
+//           break;
+//         }
+//       }
+//     }
 
-  if (!(fmt_->oformat->flags & AVFMT_NOFILE)) {
-    ret = avio_open(&fmt_->pb, path.c_str(), AVIO_FLAG_WRITE);
-    if (ret < 0) {
-      LOG(ERROR) << "[ProxyVideoWriter] avio_open failed: " << AvErr2Str(ret);
-      throw std::runtime_error("avio_open failed: " + AvErr2Str(ret));
-    }
-  }
+//     if (fmt_->oformat->flags & AVFMT_GLOBALHEADER) {
+//       enc_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+//     }
 
-  ret = avformat_write_header(fmt_, nullptr);
-  if (ret < 0) {
-    LOG(ERROR) << "[ProxyVideoWriter] avformat_write_header failed: " << AvErr2Str(ret);
-    throw std::runtime_error("avformat_write_header failed: " + AvErr2Str(ret));
-  }
+//     ret = avcodec_open2(enc_ctx_, codec, nullptr);
+//     if (ret < 0) {
+//       LOG(WARNING) << "[ProxyVideoWriter] avcodec_open2 failed for encoder "
+//                    << name << ": " << AvErr2Str(ret);
+//       avcodec_free_context(&enc_ctx_);
+//       continue;
+//     }
 
-  sws_ = sws_getContext(w, h, AV_PIX_FMT_BGR24,
-                        w, h, enc_ctx_->pix_fmt,
-                        SWS_BILINEAR, nullptr, nullptr, nullptr);
-  if (!sws_) {
-    LOG(ERROR) << "[ProxyVideoWriter] sws_getContext failed";
-    throw std::runtime_error("sws_getContext failed");
-  }
+//     encoder_name_ = codec->name ? codec->name : "unknown";
+//     LOG(INFO) << "[ProxyVideoWriter] Selected encoder: " << encoder_name_;
+//     opened = true;
+//     break;
+//   }
 
-  frame_ = av_frame_alloc();
-  if (!frame_) {
-    LOG(ERROR) << "[ProxyVideoWriter] av_frame_alloc failed";
-    throw std::runtime_error("av_frame_alloc failed");
-  }
-  frame_->format = enc_ctx_->pix_fmt;
-  frame_->width = w;
-  frame_->height = h;
-  ret = av_frame_get_buffer(frame_, 32);
-  if (ret < 0) {
-    LOG(ERROR) << "[ProxyVideoWriter] av_frame_get_buffer failed: " << AvErr2Str(ret);
-    throw std::runtime_error("av_frame_get_buffer failed: " + AvErr2Str(ret));
-  }
+//   if (!opened) {
+//     throw std::runtime_error("No usable encoder found (tried hw encoders + libx264/h264/mpeg4).");
+//   }
 
-  pkt_ = av_packet_alloc();
-  if (!pkt_) {
-    LOG(ERROR) << "[ProxyVideoWriter] av_packet_alloc failed";
-    throw std::runtime_error("av_packet_alloc failed");
-  }
+//   stream_->time_base = enc_ctx_->time_base;
+//   ret = avcodec_parameters_from_context(stream_->codecpar, enc_ctx_);
+//   if (ret < 0) {
+//     LOG(ERROR) << "[ProxyVideoWriter] avcodec_parameters_from_context failed: " << AvErr2Str(ret);
+//     throw std::runtime_error("avcodec_parameters_from_context failed: " + AvErr2Str(ret));
+//   }
 
-  LOG(INFO) << "[ProxyVideoWriter] Opened with encoder=" << encoder_name_
-            << " pix_fmt=" << av_get_pix_fmt_name(enc_ctx_->pix_fmt);
-}
+//   if (!(fmt_->oformat->flags & AVFMT_NOFILE)) {
+//     ret = avio_open(&fmt_->pb, path.c_str(), AVIO_FLAG_WRITE);
+//     if (ret < 0) {
+//       LOG(ERROR) << "[ProxyVideoWriter] avio_open failed: " << AvErr2Str(ret);
+//       throw std::runtime_error("avio_open failed: " + AvErr2Str(ret));
+//     }
+//   }
 
-void ProxyVideoWriter::Write(const cv::Mat& bgr) {
-  if (!fmt_ || !enc_ctx_ || !frame_) {
-    LOG(ERROR) << "[ProxyVideoWriter] Write called on uninitialized writer";
-    return;
-  }
-  if (bgr.empty()) {
-    LOG(WARNING) << "[ProxyVideoWriter] Write called with empty frame";
-    return;
-  }
-  if (bgr.cols != enc_ctx_->width || bgr.rows != enc_ctx_->height || bgr.type() != CV_8UC3) {
-    LOG(ERROR) << "[ProxyVideoWriter] Write: unexpected frame size/type. "
-               << "got=" << bgr.cols << "x" << bgr.rows
-               << " type=" << bgr.type()
-               << " expected=" << enc_ctx_->width << "x" << enc_ctx_->height
-               << " type=" << CV_8UC3;
-    return;
-  }
+//   ret = avformat_write_header(fmt_, nullptr);
+//   if (ret < 0) {
+//     LOG(ERROR) << "[ProxyVideoWriter] avformat_write_header failed: " << AvErr2Str(ret);
+//     throw std::runtime_error("avformat_write_header failed: " + AvErr2Str(ret));
+//   }
 
-  int ret = av_frame_make_writable(frame_);
-  if (ret < 0) {
-    LOG(ERROR) << "[ProxyVideoWriter] av_frame_make_writable failed: " << AvErr2Str(ret);
-    return;
-  }
+//   sws_ = sws_getContext(w, h, AV_PIX_FMT_BGR24,
+//                         w, h, enc_ctx_->pix_fmt,
+//                         SWS_BILINEAR, nullptr, nullptr, nullptr);
+//   if (!sws_) {
+//     LOG(ERROR) << "[ProxyVideoWriter] sws_getContext failed";
+//     throw std::runtime_error("sws_getContext failed");
+//   }
 
-  const uint8_t* src[4] = {bgr.data, nullptr, nullptr, nullptr};
-  int src_stride[4] = {static_cast<int>(bgr.step), 0, 0, 0};
+//   frame_ = av_frame_alloc();
+//   if (!frame_) {
+//     LOG(ERROR) << "[ProxyVideoWriter] av_frame_alloc failed";
+//     throw std::runtime_error("av_frame_alloc failed");
+//   }
+//   frame_->format = enc_ctx_->pix_fmt;
+//   frame_->width = w;
+//   frame_->height = h;
+//   ret = av_frame_get_buffer(frame_, 32);
+//   if (ret < 0) {
+//     LOG(ERROR) << "[ProxyVideoWriter] av_frame_get_buffer failed: " << AvErr2Str(ret);
+//     throw std::runtime_error("av_frame_get_buffer failed: " + AvErr2Str(ret));
+//   }
 
-  ret = sws_scale(sws_, src, src_stride, 0, frame_->height,
-                  frame_->data, frame_->linesize);
-  if (ret <= 0) {
-    LOG(ERROR) << "[ProxyVideoWriter] sws_scale failed, ret=" << ret;
-    return;
-  }
+//   pkt_ = av_packet_alloc();
+//   if (!pkt_) {
+//     LOG(ERROR) << "[ProxyVideoWriter] av_packet_alloc failed";
+//     throw std::runtime_error("av_packet_alloc failed");
+//   }
 
-  frame_->pts = frame_idx_++;
+//   LOG(INFO) << "[ProxyVideoWriter] Opened with encoder=" << encoder_name_
+//             << " pix_fmt=" << av_get_pix_fmt_name(enc_ctx_->pix_fmt);
+// }
 
-  ret = avcodec_send_frame(enc_ctx_, frame_);
-  if (ret < 0) {
-    LOG(ERROR) << "[ProxyVideoWriter] avcodec_send_frame failed: " << AvErr2Str(ret);
-    return;
-  }
+// void ProxyVideoWriter::Write(const cv::Mat& bgr) {
+//   if (!fmt_ || !enc_ctx_ || !frame_) {
+//     LOG(ERROR) << "[ProxyVideoWriter] Write called on uninitialized writer";
+//     return;
+//   }
+//   if (bgr.empty()) {
+//     LOG(WARNING) << "[ProxyVideoWriter] Write called with empty frame";
+//     return;
+//   }
+//   if (bgr.cols != enc_ctx_->width || bgr.rows != enc_ctx_->height || bgr.type() != CV_8UC3) {
+//     LOG(ERROR) << "[ProxyVideoWriter] Write: unexpected frame size/type. "
+//                << "got=" << bgr.cols << "x" << bgr.rows
+//                << " type=" << bgr.type()
+//                << " expected=" << enc_ctx_->width << "x" << enc_ctx_->height
+//                << " type=" << CV_8UC3;
+//     return;
+//   }
 
-  while (true) {
-    ret = avcodec_receive_packet(enc_ctx_, pkt_);
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-    if (ret < 0) {
-      LOG(ERROR) << "[ProxyVideoWriter] avcodec_receive_packet failed: " << AvErr2Str(ret);
-      break;
-    }
+//   int ret = av_frame_make_writable(frame_);
+//   if (ret < 0) {
+//     LOG(ERROR) << "[ProxyVideoWriter] av_frame_make_writable failed: " << AvErr2Str(ret);
+//     return;
+//   }
 
-    av_packet_rescale_ts(pkt_, enc_ctx_->time_base, stream_->time_base);
-    pkt_->stream_index = stream_->index;
+//   const uint8_t* src[4] = {bgr.data, nullptr, nullptr, nullptr};
+//   int src_stride[4] = {static_cast<int>(bgr.step), 0, 0, 0};
 
-    int wret = av_interleaved_write_frame(fmt_, pkt_);
-    if (wret < 0) {
-      LOG(ERROR) << "[ProxyVideoWriter] av_interleaved_write_frame failed: " << AvErr2Str(wret);
-      av_packet_unref(pkt_);
-      break;
-    }
-    av_packet_unref(pkt_);
-  }
-}
+//   ret = sws_scale(sws_, src, src_stride, 0, frame_->height,
+//                   frame_->data, frame_->linesize);
+//   if (ret <= 0) {
+//     LOG(ERROR) << "[ProxyVideoWriter] sws_scale failed, ret=" << ret;
+//     return;
+//   }
 
-void ProxyVideoWriter::Close() {
-  if (!enc_ctx_ || !fmt_) return;
+//   frame_->pts = frame_idx_++;
 
-  LOG(INFO) << "[ProxyVideoWriter] Close, total frames=" << frame_idx_;
+//   ret = avcodec_send_frame(enc_ctx_, frame_);
+//   if (ret < 0) {
+//     LOG(ERROR) << "[ProxyVideoWriter] avcodec_send_frame failed: " << AvErr2Str(ret);
+//     return;
+//   }
 
-  int ret = avcodec_send_frame(enc_ctx_, nullptr);
-  if (ret < 0 && ret != AVERROR_EOF) {
-    LOG(WARNING) << "[ProxyVideoWriter] avcodec_send_frame(flush) failed: " << AvErr2Str(ret);
-  }
+//   while (true) {
+//     ret = avcodec_receive_packet(enc_ctx_, pkt_);
+//     if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+//     if (ret < 0) {
+//       LOG(ERROR) << "[ProxyVideoWriter] avcodec_receive_packet failed: " << AvErr2Str(ret);
+//       break;
+//     }
 
-  if (pkt_) {
-    while (true) {
-      ret = avcodec_receive_packet(enc_ctx_, pkt_);
-      if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
-      if (ret < 0) {
-        LOG(WARNING) << "[ProxyVideoWriter] avcodec_receive_packet(flush) failed: " << AvErr2Str(ret);
-        break;
-      }
-      av_packet_rescale_ts(pkt_, enc_ctx_->time_base,
-                           stream_ ? stream_->time_base : enc_ctx_->time_base);
-      if (stream_) pkt_->stream_index = stream_->index;
-      int wret = av_interleaved_write_frame(fmt_, pkt_);
-      if (wret < 0) {
-        LOG(WARNING) << "[ProxyVideoWriter] av_interleaved_write_frame(flush) failed: "
-                     << AvErr2Str(wret);
-        av_packet_unref(pkt_);
-        break;
-      }
-      av_packet_unref(pkt_);
-    }
-  }
+//     av_packet_rescale_ts(pkt_, enc_ctx_->time_base, stream_->time_base);
+//     pkt_->stream_index = stream_->index;
 
-  ret = av_write_trailer(fmt_);
-  if (ret < 0) {
-    LOG(WARNING) << "[ProxyVideoWriter] av_write_trailer failed: " << AvErr2Str(ret);
-  }
+//     int wret = av_interleaved_write_frame(fmt_, pkt_);
+//     if (wret < 0) {
+//       LOG(ERROR) << "[ProxyVideoWriter] av_interleaved_write_frame failed: " << AvErr2Str(wret);
+//       av_packet_unref(pkt_);
+//       break;
+//     }
+//     av_packet_unref(pkt_);
+//   }
+// }
 
-  if (pkt_) av_packet_free(&pkt_);
-  if (frame_) av_frame_free(&frame_);
-  if (sws_) sws_freeContext(sws_);
-  if (enc_ctx_) avcodec_free_context(&enc_ctx_);
-  if (fmt_) {
-    if (!(fmt_->oformat->flags & AVFMT_NOFILE)) {
-      int c = avio_closep(&fmt_->pb);
-      if (c < 0) {
-        LOG(WARNING) << "[ProxyVideoWriter] avio_closep failed: " << AvErr2Str(c);
-      }
-    }
-    avformat_free_context(fmt_);
-  }
+// void ProxyVideoWriter::Close() {
+//   if (!enc_ctx_ || !fmt_) return;
 
-  pkt_ = nullptr;
-  frame_ = nullptr;
-  sws_ = nullptr;
-  enc_ctx_ = nullptr;
-  fmt_ = nullptr;
-  stream_ = nullptr;
-  encoder_name_.clear();
-  frame_idx_ = 0;
-}
+//   LOG(INFO) << "[ProxyVideoWriter] Close, total frames=" << frame_idx_;
+
+//   int ret = avcodec_send_frame(enc_ctx_, nullptr);
+//   if (ret < 0 && ret != AVERROR_EOF) {
+//     LOG(WARNING) << "[ProxyVideoWriter] avcodec_send_frame(flush) failed: " << AvErr2Str(ret);
+//   }
+
+//   if (pkt_) {
+//     while (true) {
+//       ret = avcodec_receive_packet(enc_ctx_, pkt_);
+//       if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
+//       if (ret < 0) {
+//         LOG(WARNING) << "[ProxyVideoWriter] avcodec_receive_packet(flush) failed: " << AvErr2Str(ret);
+//         break;
+//       }
+//       av_packet_rescale_ts(pkt_, enc_ctx_->time_base,
+//                            stream_ ? stream_->time_base : enc_ctx_->time_base);
+//       if (stream_) pkt_->stream_index = stream_->index;
+//       int wret = av_interleaved_write_frame(fmt_, pkt_);
+//       if (wret < 0) {
+//         LOG(WARNING) << "[ProxyVideoWriter] av_interleaved_write_frame(flush) failed: "
+//                      << AvErr2Str(wret);
+//         av_packet_unref(pkt_);
+//         break;
+//       }
+//       av_packet_unref(pkt_);
+//     }
+//   }
+
+//   ret = av_write_trailer(fmt_);
+//   if (ret < 0) {
+//     LOG(WARNING) << "[ProxyVideoWriter] av_write_trailer failed: " << AvErr2Str(ret);
+//   }
+
+//   if (pkt_) av_packet_free(&pkt_);
+//   if (frame_) av_frame_free(&frame_);
+//   if (sws_) sws_freeContext(sws_);
+//   if (enc_ctx_) avcodec_free_context(&enc_ctx_);
+//   if (fmt_) {
+//     if (!(fmt_->oformat->flags & AVFMT_NOFILE)) {
+//       int c = avio_closep(&fmt_->pb);
+//       if (c < 0) {
+//         LOG(WARNING) << "[ProxyVideoWriter] avio_closep failed: " << AvErr2Str(c);
+//       }
+//     }
+//     avformat_free_context(fmt_);
+//   }
+
+//   pkt_ = nullptr;
+//   frame_ = nullptr;
+//   sws_ = nullptr;
+//   enc_ctx_ = nullptr;
+//   fmt_ = nullptr;
+//   stream_ = nullptr;
+//   encoder_name_.clear();
+//   frame_idx_ = 0;
+// }
 
 // ---------------- VideoPreprocessor (decode + CPU resize + prefetch) ----------------
 
@@ -436,17 +463,27 @@ bool VideoPreprocessor::TryOpenVideo(std::string* err) {
 
   LOG(INFO) << "[VideoPreprocessor] Proxy size=" << proxy_w_ << "x" << proxy_h_;
 
-  // Compute fps for writer (best-effort).
+  // 计算写入器的 FPS（优先使用视频流的帧率）
   double fps = 0.0;
-  if (info_.total_time_sec > 0.0 && info_.num_frames > 1) {
-    fps = static_cast<double>(info_.num_frames - 1) / info_.total_time_sec;
-  } else if (video_st_) {
+
+  // 优先使用 avg_frame_rate 或 r_frame_rate
+  if (video_st_) {
     AVRational fr = video_st_->avg_frame_rate.num && video_st_->avg_frame_rate.den
-                        ? video_st_->avg_frame_rate
-                        : video_st_->r_frame_rate;
+                        ? video_st_->avg_frame_rate  // 如果 avg_frame_rate 有效
+                        : video_st_->r_frame_rate;  // 否则使用 r_frame_rate
     fps = RationalToDouble(fr);
   }
-  if (fps <= 0.0) fps = 30.0;
+
+  // 如果通过流信息计算出的 fps 无效，使用总时间和帧数计算 FPS
+  if (fps <= 0.0 && info_.total_time_sec > 0.0 && info_.num_frames > 1) {
+    fps = static_cast<double>(info_.num_frames - 1) / info_.total_time_sec;
+  }
+
+  // 如果 FPS 仍然无效，则使用默认值 30.0
+  if (fps <= 0.0) {
+    fps = 30.0;
+  }
+
   fps_hint_ = fps;
 
   info_.fps = fps_hint_;

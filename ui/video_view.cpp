@@ -399,8 +399,6 @@ void VideoView::PaintStabilizedView(QPainter* painter, const QRectF& draw_rect,
   // Paint black canvas inside draw_rect
   painter->fillRect(draw_rect, QColor(0, 0, 0));
 
-  // Draw the image translated within draw_rect.
-  // shift_px is in "image pixel" coords, so convert to widget pixels by scale.
   const int img_w = img.width();
   const int img_h = img.height();
   if (img_w <= 0 || img_h <= 0) {
@@ -414,11 +412,11 @@ void VideoView::PaintStabilizedView(QPainter* painter, const QRectF& draw_rect,
   const double tx = -shift_px.x() * sx;
   const double ty = -shift_px.y() * sy;
 
-  // Translate painter, then draw the image as usual to draw_rect.
+  // --------- 1) draw to screen (existing behavior) ----------
   painter->save();
   painter->setClipRect(draw_rect);
   painter->translate(tx, ty);
-  painter->drawImage(draw_rect, img);  // letterbox already represented by draw_rect
+  painter->drawImage(draw_rect, img);
   painter->restore();
 
   // Draw shift text
@@ -429,6 +427,94 @@ void VideoView::PaintStabilizedView(QPainter* painter, const QRectF& draw_rect,
   QRectF tr(draw_rect.x() + 10, draw_rect.y() + 10, draw_rect.width() - 20, 24);
   painter->fillRect(tr.adjusted(-6, -3, 6, 3), QColor(0, 0, 0, 140));
   painter->drawText(tr, Qt::AlignLeft | Qt::AlignVCenter, s);
+
+  // --------- 2) debug record: offscreen render + VideoWriter (static) ----------
+  // Toggle by environment variable to avoid touching UI plumbing:
+  //   AIRSTEADY_STABLE_REC=1
+  // Output:
+  //   ./stable_debug.mp4   (relative to working dir)
+  static bool s_enabled = true;
+  static bool s_inited = false;
+  static cv::VideoWriter s_writer;
+  static int s_w = 0, s_h = 0;
+  static int64_t s_frame_count = 0;
+
+  if (!s_inited) {
+    s_inited = true;
+    const QByteArray env = qgetenv("AIRSTEADY_STABLE_REC");
+    // s_enabled = (!env.isEmpty() && env != "0");
+
+    if (s_enabled) {
+      // Record full widget size for easiest viewing.
+      const QSize widget_size = this->size();
+      s_w = widget_size.width();
+      s_h = widget_size.height();
+
+      const int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+      const double fps = 30.0;  // fixed debug fps
+      const std::string out_path = "stable_debug.mp4";
+
+      s_writer.open(out_path, fourcc, fps, cv::Size(s_w, s_h), true);
+      if (!s_writer.isOpened()) {
+        LOG(ERROR) << "[VideoView][StableRec] Failed to open " << out_path;
+        s_enabled = false;
+      } else {
+        LOG(INFO) << "[VideoView][StableRec] Recording to " << out_path
+                  << " size=" << s_w << "x" << s_h << " fps=" << fps;
+      }
+    }
+  }
+
+  if (s_enabled && s_writer.isOpened()) {
+    // If user resizes the widget mid-run, stop to avoid broken stream.
+    const QSize widget_size = this->size();
+    if (widget_size.width() != s_w || widget_size.height() != s_h) {
+      LOG(WARNING) << "[VideoView][StableRec] Widget resized, stop recording. "
+                   << "old=" << s_w << "x" << s_h
+                   << " new=" << widget_size.width() << "x" << widget_size.height();
+      s_writer.release();
+      s_enabled = false;
+    } else {
+      // Offscreen canvas = what user sees (full widget).
+      QImage canvas(widget_size, QImage::Format_ARGB32_Premultiplied);
+      canvas.fill(QColor(20, 20, 20));  // same background as paintEvent()
+
+      QPainter p2(&canvas);
+      p2.setRenderHint(QPainter::Antialiasing, true);
+
+      // Re-render the stabilized view into canvas (same logic, but using p2)
+      // NOTE: draw_rect is in widget coords already.
+      p2.fillRect(draw_rect, QColor(0, 0, 0));
+
+      p2.save();
+      p2.setClipRect(draw_rect);
+      p2.translate(tx, ty);
+      p2.drawImage(draw_rect, img);
+      p2.restore();
+
+      p2.setPen(QColor(230, 230, 230));
+      p2.fillRect(tr.adjusted(-6, -3, 6, 3), QColor(0, 0, 0, 140));
+      p2.drawText(tr, Qt::AlignLeft | Qt::AlignVCenter, s);
+      p2.end();
+
+      // QImage -> cv::Mat(BGR)
+      QImage argb = canvas.convertToFormat(QImage::Format_ARGB32);
+      cv::Mat bgra(argb.height(), argb.width(), CV_8UC4,
+                   const_cast<uchar*>(argb.bits()),
+                   static_cast<size_t>(argb.bytesPerLine()));
+      cv::Mat bgr;
+      cv::cvtColor(bgra, bgr, cv::COLOR_BGRA2BGR);
+
+      s_writer.write(bgr);
+      ++s_frame_count;
+
+      // Optional: auto-stop after N frames to avoid huge files.
+      // if (s_frame_count >= 300) { s_writer.release(); s_enabled = false; }
+      if ((s_frame_count % 60) == 0) {
+        LOG(INFO) << "[VideoView][StableRec] wrote frames=" << s_frame_count;
+      }
+    }
+  }
 
   painter->restore();
 }

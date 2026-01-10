@@ -50,9 +50,9 @@ struct StabilizerConfig {
   int timing_log_every_irls_iter = 1;  // 1 = every iter
 
   // Step-1 (object centers) base sigmas (pixel-domain).
-  double global_sigma_px = 2.0;            // when global_center_valid
-  double weak_center_sigma_px = 200.0;     // when global invalid, weak pull to image center
-  double odom_sigma_px = 3.0;              // when delta_valid but delta_noise absent
+  double global_sigma_px = 1000000000.0;            // when global_center_valid
+  double weak_center_sigma_px = 20000000.0;     // when global invalid, weak pull to image center
+  double odom_sigma_px = 1.0;              // when delta_valid but delta_noise absent
   double odom_invalid_sigma_px = 80.0;     // when delta invalid, weak equality
 
   // Step-2 (smooth centers) base sigmas.
@@ -62,9 +62,9 @@ struct StabilizerConfig {
   double smooth_data_sigma_min_px = 50.0;  // minimal data influence when smooth_factor ~ 1
 
   // Robust / IRLS.
-  bool robust_enable = true;
-  int irls_max_iters = 5;
-  double irls_eps_px = 1e-2;               // early stop threshold (avg delta change)
+  bool robust_enable = false;
+  int irls_max_iters = 100;
+  double irls_eps_px = 1e-8;               // early stop threshold (avg delta change)
   double huber_delta_px = 6.0;             // Huber threshold in pixels
 
   // Numerical safety.

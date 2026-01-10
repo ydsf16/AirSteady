@@ -52,6 +52,7 @@ class Previewer {
   // Register preview callback; usually called once after Processor creation.
   using PreviewCallback = std::function<void(const FramePreview& frame_preview)>;
   void AddPreviewCallback(PreviewCallback cb);
+  void AddPreviewDoneCallback(std::function<void()> cb);
 
  private:
   void Run();  // Worker thread main loop.
@@ -91,6 +92,8 @@ class Previewer {
   int single_preview_frame_idx_ = 0;
   FramePreview single_preview_;  // Reserved for future use.
   std::condition_variable single_preview_cv_;
+
+  std::function<void()> preview_done_cb_;
 };
 
 }  // namespace airsteady
