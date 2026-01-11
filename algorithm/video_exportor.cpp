@@ -12,6 +12,17 @@
 #include <utility>
 #include <vector>
 
+#include <condition_variable>
+#include <deque>
+#include <functional>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+#if defined(__SSE4_1__) || defined(__AVX2__) || defined(_MSC_VER)
+#include <immintrin.h>
+#endif
+
 #include <glog/logging.h>
 
 extern "C" {
@@ -829,27 +840,41 @@ CanvasPlan ComputeCanvasPlanAndShifts(
     }
   }
 
-  // Canvas bounds: convert float shift range into integer padding.
-  // We bias outward (floor/ceil) to guarantee all frames fit.
-  const int min_sx_i = static_cast<int>(std::floor(min_sx));
-  const int max_sx_i = static_cast<int>(std::ceil(max_sx));
-  const int min_sy_i = static_cast<int>(std::floor(min_sy));
-  const int max_sy_i = static_cast<int>(std::ceil(max_sy));
+// Canvas bounds: convert float shift range into integer padding.
+// We bias outward (floor/ceil) to guarantee all frames fit.
+const int min_sx_i = static_cast<int>(std::floor(min_sx));
+const int max_sx_i = static_cast<int>(std::ceil(max_sx));
+const int min_sy_i = static_cast<int>(std::floor(min_sy));
+const int max_sy_i = static_cast<int>(std::ceil(max_sy));
 
-  int canvas_w = src_w + (max_sx_i - min_sx_i);
-  int canvas_h = src_h + (max_sy_i - min_sy_i);
-  if (canvas_w <= 0) canvas_w = 2;
-  if (canvas_h <= 0) canvas_h = 2;
+// ---- Fixed semantics (required) ----
+// "Canvas is determined first; place the source frame centered on the canvas;
+// then apply (delta_x, delta_y) as a global translation (fractional allowed)."
+//
+// Strong constraint: when delta_x = 0 and delta_y = 0, the source center must
+// coincide with the canvas center.
+//
+// To guarantee that *no* frame is cropped, we enforce symmetric padding that
+// covers the maximum absolute shift on both sides.
+const int max_abs_sx_i = std::max(std::abs(min_sx_i), std::abs(max_sx_i));
+const int max_abs_sy_i = std::max(std::abs(min_sy_i), std::abs(max_sy_i));
 
-  // Final output resolution must be even.
-  if (canvas_w & 1) ++canvas_w;
-  if (canvas_h & 1) ++canvas_h;
+int canvas_w = src_w + 2 * max_abs_sx_i;
+int canvas_h = src_h + 2 * max_abs_sy_i;
+if (canvas_w <= 0) canvas_w = 2;
+if (canvas_h <= 0) canvas_h = 2;
 
-  CanvasPlan plan;
-  plan.canvas_w = canvas_w;
-  plan.canvas_h = canvas_h;
-  plan.origin_x = -min_sx_i;
-  plan.origin_y = -min_sy_i;
+// Final output resolution must be even.
+if (canvas_w & 1) ++canvas_w;
+if (canvas_h & 1) ++canvas_h;
+
+CanvasPlan plan;
+plan.canvas_w = canvas_w;
+plan.canvas_h = canvas_h;
+
+// Center placement for delta=0.
+plan.origin_x = (canvas_w - src_w) / 2;
+plan.origin_y = (canvas_h - src_h) / 2;
 
   *out_num_frames = nframes;
   return plan;
@@ -1007,6 +1032,177 @@ inline double ClampDouble(double v, double lo, double hi) {
   return std::max(lo, std::min(v, hi));
 }
 
+
+// --------------------------- parallel helpers -----------------------------
+
+class BlitWorkerPool {
+ public:
+  static BlitWorkerPool& Instance() {
+    static BlitWorkerPool pool(NumThreads());
+    return pool;
+  }
+
+  template <class Fn>
+  void ParallelFor(int begin, int end, int grain, Fn fn) {
+    if (end <= begin) return;
+    const int total = end - begin;
+    const int nt = num_threads_;
+    if (nt <= 1 || total <= grain) {
+      fn(begin, end);
+      return;
+    }
+
+    // Split into tasks.
+    const int task_count = (total + grain - 1) / grain;
+    if (task_count <= 1) {
+      fn(begin, end);
+      return;
+    }
+
+    std::unique_lock<std::mutex> lk(mtx_);
+    pending_ = task_count;
+    // Note: we type-erase tasks; this is acceptable because the heavy work
+    // is inside each task and the task count is small (O(height/grain)).
+    for (int t = 0; t < task_count; ++t) {
+      const int b = begin + t * grain;
+      const int e = std::min(end, b + grain);
+      tasks_.emplace_back([=]() { fn(b, e); });
+    }
+    lk.unlock();
+    cv_.notify_all();
+
+    // Run one task on the caller thread to reduce wakeup overhead.
+    while (true) {
+      std::function<void()> job;
+      {
+        std::lock_guard<std::mutex> g(mtx_);
+        if (tasks_.empty()) break;
+        job = std::move(tasks_.back());
+        tasks_.pop_back();
+      }
+      job();
+      FinishOne_();
+    }
+
+    // Wait until all tasks complete.
+    std::unique_lock<std::mutex> lk2(done_mtx_);
+    done_cv_.wait(lk2, [&]() { return pending_ == 0; });
+  }
+
+ private:
+  static int NumThreads() {
+    unsigned hc = std::thread::hardware_concurrency();
+    if (hc == 0) hc = 4;
+    // Export itself runs in a worker thread; avoid oversubscription.
+    int nt = static_cast<int>(hc >= 2 ? (hc - 1) : 1);
+    // Cap to keep scheduling overhead bounded on very large machines.
+    nt = std::min(nt, 12);
+    return std::max(nt, 1);
+  }
+
+  explicit BlitWorkerPool(int num_threads) : num_threads_(num_threads) {
+    if (num_threads_ <= 1) return;
+    workers_.reserve(static_cast<size_t>(num_threads_));
+    for (int i = 0; i < num_threads_; ++i) {
+      workers_.emplace_back([this]() { WorkerLoop_(); });
+    }
+  }
+
+  ~BlitWorkerPool() {
+    {
+      std::lock_guard<std::mutex> g(mtx_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto& t : workers_) {
+      if (t.joinable()) t.join();
+    }
+  }
+
+  void WorkerLoop_() {
+    while (true) {
+      std::function<void()> job;
+      {
+        std::unique_lock<std::mutex> lk(mtx_);
+        cv_.wait(lk, [&]() { return stop_ || !tasks_.empty(); });
+        if (stop_ && tasks_.empty()) return;
+        job = std::move(tasks_.back());
+        tasks_.pop_back();
+      }
+      job();
+      FinishOne_();
+    }
+  }
+
+  void FinishOne_() {
+    int left = 0;
+    {
+      std::lock_guard<std::mutex> g(done_mtx_);
+      left = --pending_;
+    }
+    if (left == 0) done_cv_.notify_one();
+  }
+
+  int num_threads_ = 1;
+
+  std::mutex mtx_;
+  std::condition_variable cv_;
+  bool stop_ = false;
+  std::deque<std::function<void()>> tasks_;
+  std::vector<std::thread> workers_;
+
+  std::mutex done_mtx_;
+  std::condition_variable done_cv_;
+  int pending_ = 0;
+};
+
+// Fixed-point weights for pure translation bilinear.
+struct FixedWeightsQ8 {
+  static constexpr int kFracBits = 8;
+  static constexpr int kScale = 1 << kFracBits;  // 256
+  int wx0 = kScale;  // weight for ix
+  int wx1 = 0;       // weight for ix+1
+  int wy0 = kScale;
+  int wy1 = 0;
+  int cx = 0;  // ceil(dst_x)
+  int cy = 0;  // ceil(dst_y)
+};
+
+// Compute constant weights for a global translation by (dst_x, dst_y).
+inline FixedWeightsQ8 ComputeFixedWeightsQ8(double dst_x, double dst_y) {
+  FixedWeightsQ8 w;
+  w.cx = static_cast<int>(std::ceil(dst_x));
+  w.cy = static_cast<int>(std::ceil(dst_y));
+
+  // For integer output pixel x, source coordinate is sx = x - dst_x.
+  // With translation only, fractional part is constant:
+  // sx = (x - ceil(dst_x)) + (ceil(dst_x) - dst_x).
+  const double fx = ClampDouble(static_cast<double>(w.cx) - dst_x, 0.0, 1.0);
+  const double fy = ClampDouble(static_cast<double>(w.cy) - dst_y, 0.0, 1.0);
+
+  w.wx1 = ClampInt(static_cast<int>(std::lround(fx * FixedWeightsQ8::kScale)), 0,
+                   FixedWeightsQ8::kScale);
+  w.wx0 = FixedWeightsQ8::kScale - w.wx1;
+
+  w.wy1 = ClampInt(static_cast<int>(std::lround(fy * FixedWeightsQ8::kScale)), 0,
+                   FixedWeightsQ8::kScale);
+  w.wy0 = FixedWeightsQ8::kScale - w.wy1;
+  return w;
+}
+
+inline int ComputeDstX0(double dst_x) {
+  return std::max(0, static_cast<int>(std::ceil(dst_x)));
+}
+inline int ComputeDstY0(double dst_y) {
+  return std::max(0, static_cast<int>(std::ceil(dst_y)));
+}
+inline int ComputeDstX1(int dst_w, double dst_x, int src_w) {
+  return std::min(dst_w - 1, static_cast<int>(std::floor(dst_x + src_w - 1.0)));
+}
+inline int ComputeDstY1(int dst_h, double dst_y, int src_h) {
+  return std::min(dst_h - 1, static_cast<int>(std::floor(dst_y + src_h - 1.0)));
+}
+
 // Bilinear blit for 8-bit single-channel plane.
 // Places src plane at (dst_x, dst_y) (top-left) in dst plane coordinates.
 void BlitPlaneBilinearU8(const uint8_t* src,
@@ -1022,45 +1218,169 @@ void BlitPlaneBilinearU8(const uint8_t* src,
   if (!src || !dst) return;
   if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return;
 
-  const int x0 = std::max(0, static_cast<int>(std::ceil(dst_x)));
-  const int y0 = std::max(0, static_cast<int>(std::ceil(dst_y)));
-  const int x1 = std::min(dst_w - 1, static_cast<int>(std::floor(dst_x + src_w - 1.0)));
-  const int y1 = std::min(dst_h - 1, static_cast<int>(std::floor(dst_y + src_h - 1.0)));
+  const FixedWeightsQ8 w = ComputeFixedWeightsQ8(dst_x, dst_y);
+  const int x0 = ComputeDstX0(dst_x);
+  const int y0 = ComputeDstY0(dst_y);
+  const int x1 = ComputeDstX1(dst_w, dst_x, src_w);
+  const int y1 = ComputeDstY1(dst_h, dst_y, src_h);
   if (x0 > x1 || y0 > y1) return;
 
-  for (int y = y0; y <= y1; ++y) {
-    const double sy = static_cast<double>(y) - dst_y;
-    const int iy0 = ClampInt(static_cast<int>(std::floor(sy)), 0, src_h - 1);
-    const int iy1 = ClampInt(iy0 + 1, 0, src_h - 1);
-    const double fy = ClampDouble(sy - std::floor(sy), 0.0, 1.0);
+  // Fast-path interior region where (ix, iy) and their +1 neighbors are within bounds.
+  const int xf0 = std::max(x0, w.cx);
+  const int yf0 = std::max(y0, w.cy);
+  const int xf1 = std::min(x1, w.cx + src_w - 2);
+  const int yf1 = std::min(y1, w.cy + src_h - 2);
 
-    const uint8_t* row0 = src + iy0 * src_linesize;
-    const uint8_t* row1 = src + iy1 * src_linesize;
-    uint8_t* drow = dst + y * dst_linesize;
+  auto blit_rows = [&](int y_begin, int y_end) {
+    const __m128i zero = _mm_setzero_si128();
+#if defined(__SSE4_1__)
+    const __m128i wx_pair = _mm_set_epi16(
+        static_cast<int16_t>(w.wx1), static_cast<int16_t>(w.wx0),
+        static_cast<int16_t>(w.wx1), static_cast<int16_t>(w.wx0),
+        static_cast<int16_t>(w.wx1), static_cast<int16_t>(w.wx0),
+        static_cast<int16_t>(w.wx1), static_cast<int16_t>(w.wx0));
+    const __m128i wy_pair = _mm_set_epi16(
+        static_cast<int16_t>(w.wy1), static_cast<int16_t>(w.wy0),
+        static_cast<int16_t>(w.wy1), static_cast<int16_t>(w.wy0),
+        static_cast<int16_t>(w.wy1), static_cast<int16_t>(w.wy0),
+        static_cast<int16_t>(w.wy1), static_cast<int16_t>(w.wy0));
+#endif
 
-    for (int x = x0; x <= x1; ++x) {
-      const double sx = static_cast<double>(x) - dst_x;
-      const int ix0 = ClampInt(static_cast<int>(std::floor(sx)), 0, src_w - 1);
-      const int ix1 = ClampInt(ix0 + 1, 0, src_w - 1);
-      const double fx = ClampDouble(sx - std::floor(sx), 0.0, 1.0);
+    for (int y = y_begin; y < y_end; ++y) {
+      const int iy = y - w.cy;
+      // Determine whether this row is fully inside the "no-clamp" vertical region.
+      const bool y_fast = (y >= yf0 && y <= yf1);
+      const int iy0 = y_fast ? iy : ClampInt(iy, 0, src_h - 1);
+      const int iy1 = y_fast ? (iy + 1) : ClampInt(iy0 + 1, 0, src_h - 1);
 
-      const double w00 = (1.0 - fx) * (1.0 - fy);
-      const double w10 = fx * (1.0 - fy);
-      const double w01 = (1.0 - fx) * fy;
-      const double w11 = fx * fy;
+      const uint8_t* row0 = src + iy0 * src_linesize;
+      const uint8_t* row1 = src + iy1 * src_linesize;
+      uint8_t* drow = dst + y * dst_linesize;
 
-      const int p00 = row0[ix0];
-      const int p10 = row0[ix1];
-      const int p01 = row1[ix0];
-      const int p11 = row1[ix1];
+      if (!y_fast) {
+        // Slow path for top/bottom edge rows: clamp both X and Y.
+        for (int x = x0; x <= x1; ++x) {
+          const int ix = x - w.cx;
+          const int ix0 = ClampInt(ix, 0, src_w - 1);
+          const int ix1c = ClampInt(ix0 + 1, 0, src_w - 1);
 
-      int v = static_cast<int>(std::lround(w00 * p00 + w10 * p10 + w01 * p01 + w11 * p11));
-      v = ClampInt(v, 0, 255);
-      drow[x] = static_cast<uint8_t>(v);
+          const int p00 = row0[ix0];
+          const int p10 = row0[ix1c];
+          const int p01 = row1[ix0];
+          const int p11 = row1[ix1c];
+
+          const int h0 = p00 * w.wx0 + p10 * w.wx1;  // Q8
+          const int h1 = p01 * w.wx0 + p11 * w.wx1;  // Q8
+          const int v = h0 * w.wy0 + h1 * w.wy1;     // Q16
+          drow[x] = static_cast<uint8_t>((v + 32768) >> 16);
+        }
+        continue;
+      }
+
+      // Left edge (may need X clamp).
+      for (int x = x0; x < std::min(xf0, x1 + 1); ++x) {
+        const int ix = x - w.cx;
+        const int ix0 = ClampInt(ix, 0, src_w - 1);
+        const int ix1c = ClampInt(ix0 + 1, 0, src_w - 1);
+
+        const int p00 = row0[ix0];
+        const int p10 = row0[ix1c];
+        const int p01 = row1[ix0];
+        const int p11 = row1[ix1c];
+
+        const int h0 = p00 * w.wx0 + p10 * w.wx1;  // Q8
+        const int h1 = p01 * w.wx0 + p11 * w.wx1;  // Q8
+        const int v = h0 * w.wy0 + h1 * w.wy1;     // Q16
+        drow[x] = static_cast<uint8_t>((v + 32768) >> 16);
+      }
+
+      // Interior fast region: no clamp, SIMD where available.
+      if (xf0 <= xf1) {
+        int x = xf0;
+#if defined(__SSE4_1__)
+        // Process 8 pixels per iteration.
+        for (; x + 7 <= xf1; x += 8) {
+          const int ix = x - w.cx;
+
+          const __m128i s00_8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row0 + ix));
+          const __m128i s10_8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row0 + ix + 1));
+          const __m128i s01_8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row1 + ix));
+          const __m128i s11_8 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(row1 + ix + 1));
+
+          const __m128i p00 = _mm_unpacklo_epi8(s00_8, zero);
+          const __m128i p10 = _mm_unpacklo_epi8(s10_8, zero);
+          const __m128i p01 = _mm_unpacklo_epi8(s01_8, zero);
+          const __m128i p11 = _mm_unpacklo_epi8(s11_8, zero);
+
+          const __m128i in0_lo = _mm_unpacklo_epi16(p00, p10);
+          const __m128i in0_hi = _mm_unpackhi_epi16(p00, p10);
+          const __m128i in1_lo = _mm_unpacklo_epi16(p01, p11);
+          const __m128i in1_hi = _mm_unpackhi_epi16(p01, p11);
+
+          // Horizontal sums are Q8 (0..65280), in 32-bit lanes.
+          const __m128i h0_lo_32 = _mm_madd_epi16(in0_lo, wx_pair);
+          const __m128i h0_hi_32 = _mm_madd_epi16(in0_hi, wx_pair);
+          const __m128i h1_lo_32 = _mm_madd_epi16(in1_lo, wx_pair);
+          const __m128i h1_hi_32 = _mm_madd_epi16(in1_hi, wx_pair);
+
+          // Pack to 16-bit (unsigned) to reuse madd for vertical combine.
+          const __m128i h0_16 = _mm_packus_epi32(h0_lo_32, h0_hi_32);
+          const __m128i h1_16 = _mm_packus_epi32(h1_lo_32, h1_hi_32);
+
+          const __m128i vin_lo = _mm_unpacklo_epi16(h0_16, h1_16);
+          const __m128i vin_hi = _mm_unpackhi_epi16(h0_16, h1_16);
+
+          const __m128i v_lo_32 = _mm_madd_epi16(vin_lo, wy_pair);  // Q16
+          const __m128i v_hi_32 = _mm_madd_epi16(vin_hi, wy_pair);  // Q16
+
+          // (v + 32768) >> 16
+          const __m128i v_lo = _mm_srli_epi32(_mm_add_epi32(v_lo_32, _mm_set1_epi32(32768)), 16);
+          const __m128i v_hi = _mm_srli_epi32(_mm_add_epi32(v_hi_32, _mm_set1_epi32(32768)), 16);
+
+          const __m128i v_16 = _mm_packus_epi32(v_lo, v_hi);
+          const __m128i v_8 = _mm_packus_epi16(v_16, v_16);
+
+          // Store 8 bytes.
+          std::memcpy(drow + x, &v_8, 8);
+        }
+#endif
+        // Tail of interior.
+        for (; x <= xf1; ++x) {
+          const int ix = x - w.cx;
+          const int p00 = row0[ix];
+          const int p10 = row0[ix + 1];
+          const int p01 = row1[ix];
+          const int p11 = row1[ix + 1];
+
+          const int h0 = p00 * w.wx0 + p10 * w.wx1;  // Q8
+          const int h1 = p01 * w.wx0 + p11 * w.wx1;  // Q8
+          const int v = h0 * w.wy0 + h1 * w.wy1;     // Q16
+          drow[x] = static_cast<uint8_t>((v + 32768) >> 16);
+        }
+      }
+
+      // Right edge (may need X clamp).
+      for (int x = std::max(xf1 + 1, x0); x <= x1; ++x) {
+        const int ix = x - w.cx;
+        const int ix0 = ClampInt(ix, 0, src_w - 1);
+        const int ix1c = ClampInt(ix0 + 1, 0, src_w - 1);
+
+        const int p00 = row0[ix0];
+        const int p10 = row0[ix1c];
+        const int p01 = row1[ix0];
+        const int p11 = row1[ix1c];
+
+        const int h0 = p00 * w.wx0 + p10 * w.wx1;  // Q8
+        const int h1 = p01 * w.wx0 + p11 * w.wx1;  // Q8
+        const int v = h0 * w.wy0 + h1 * w.wy1;     // Q16
+        drow[x] = static_cast<uint8_t>((v + 32768) >> 16);
+      }
     }
-  }
-}
+  };
 
+  // Parallelize by rows. A grain size of 32 rows is a good default on Windows.
+  BlitWorkerPool::Instance().ParallelFor(y0, y1 + 1, 32, blit_rows);
+}
 // Bilinear blit for 16-bit single-channel plane (used by YUV420P10LE).
 void BlitPlaneBilinearU16(const uint8_t* src_bytes,
                           int src_linesize,
@@ -1075,48 +1395,153 @@ void BlitPlaneBilinearU16(const uint8_t* src_bytes,
   if (!src_bytes || !dst_bytes) return;
   if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return;
 
-  const int x0 = std::max(0, static_cast<int>(std::ceil(dst_x)));
-  const int y0 = std::max(0, static_cast<int>(std::ceil(dst_y)));
-  const int x1 = std::min(dst_w - 1, static_cast<int>(std::floor(dst_x + src_w - 1.0)));
-  const int y1 = std::min(dst_h - 1, static_cast<int>(std::floor(dst_y + src_h - 1.0)));
+  const FixedWeightsQ8 w = ComputeFixedWeightsQ8(dst_x, dst_y);
+  const int x0 = ComputeDstX0(dst_x);
+  const int y0 = ComputeDstY0(dst_y);
+  const int x1 = ComputeDstX1(dst_w, dst_x, src_w);
+  const int y1 = ComputeDstY1(dst_h, dst_y, src_h);
   if (x0 > x1 || y0 > y1) return;
 
-  for (int y = y0; y <= y1; ++y) {
-    const double sy = static_cast<double>(y) - dst_y;
-    const int iy0 = ClampInt(static_cast<int>(std::floor(sy)), 0, src_h - 1);
-    const int iy1 = ClampInt(iy0 + 1, 0, src_h - 1);
-    const double fy = ClampDouble(sy - std::floor(sy), 0.0, 1.0);
+  const int xf0 = std::max(x0, w.cx);
+  const int yf0 = std::max(y0, w.cy);
+  const int xf1 = std::min(x1, w.cx + src_w - 2);
+  const int yf1 = std::min(y1, w.cy + src_h - 2);
 
-    const uint16_t* row0 =
-        reinterpret_cast<const uint16_t*>(src_bytes + iy0 * src_linesize);
-    const uint16_t* row1 =
-        reinterpret_cast<const uint16_t*>(src_bytes + iy1 * src_linesize);
-    uint16_t* drow =
-        reinterpret_cast<uint16_t*>(dst_bytes + y * dst_linesize);
+  auto blit_rows = [&](int y_begin, int y_end) {
+#if defined(__SSE4_1__)
+    const __m128i wx_pair = _mm_set_epi16(
+        static_cast<int16_t>(w.wx1), static_cast<int16_t>(w.wx0),
+        static_cast<int16_t>(w.wx1), static_cast<int16_t>(w.wx0),
+        static_cast<int16_t>(w.wx1), static_cast<int16_t>(w.wx0),
+        static_cast<int16_t>(w.wx1), static_cast<int16_t>(w.wx0));
+    const __m128i wy_pair = _mm_set_epi16(
+        static_cast<int16_t>(w.wy1), static_cast<int16_t>(w.wy0),
+        static_cast<int16_t>(w.wy1), static_cast<int16_t>(w.wy0),
+        static_cast<int16_t>(w.wy1), static_cast<int16_t>(w.wy0),
+        static_cast<int16_t>(w.wy1), static_cast<int16_t>(w.wy0));
+#endif
 
-    for (int x = x0; x <= x1; ++x) {
-      const double sx = static_cast<double>(x) - dst_x;
-      const int ix0 = ClampInt(static_cast<int>(std::floor(sx)), 0, src_w - 1);
-      const int ix1 = ClampInt(ix0 + 1, 0, src_w - 1);
-      const double fx = ClampDouble(sx - std::floor(sx), 0.0, 1.0);
+    for (int y = y_begin; y < y_end; ++y) {
+      const int iy = y - w.cy;
+      const bool y_fast = (y >= yf0 && y <= yf1);
+      const int iy0 = y_fast ? iy : ClampInt(iy, 0, src_h - 1);
+      const int iy1 = y_fast ? (iy + 1) : ClampInt(iy0 + 1, 0, src_h - 1);
 
-      const double w00 = (1.0 - fx) * (1.0 - fy);
-      const double w10 = fx * (1.0 - fy);
-      const double w01 = (1.0 - fx) * fy;
-      const double w11 = fx * fy;
+      const uint16_t* row0 =
+          reinterpret_cast<const uint16_t*>(src_bytes + iy0 * src_linesize);
+      const uint16_t* row1 =
+          reinterpret_cast<const uint16_t*>(src_bytes + iy1 * src_linesize);
+      uint16_t* drow =
+          reinterpret_cast<uint16_t*>(dst_bytes + y * dst_linesize);
 
-      const double p00 = static_cast<double>(row0[ix0]);
-      const double p10 = static_cast<double>(row0[ix1]);
-      const double p01 = static_cast<double>(row1[ix0]);
-      const double p11 = static_cast<double>(row1[ix1]);
+      if (!y_fast) {
+        for (int x = x0; x <= x1; ++x) {
+          const int ix = x - w.cx;
+          const int ix0 = ClampInt(ix, 0, src_w - 1);
+          const int ix1c = ClampInt(ix0 + 1, 0, src_w - 1);
 
-      double v = w00 * p00 + w10 * p10 + w01 * p01 + w11 * p11;
-      int iv = ClampInt(static_cast<int>(std::lround(v)), 0, 65535);
-      drow[x] = static_cast<uint16_t>(iv);
+          const uint32_t p00 = row0[ix0];
+          const uint32_t p10 = row0[ix1c];
+          const uint32_t p01 = row1[ix0];
+          const uint32_t p11 = row1[ix1c];
+
+          const uint32_t h0 = p00 * w.wx0 + p10 * w.wx1;  // Q8
+          const uint32_t h1 = p01 * w.wx0 + p11 * w.wx1;  // Q8
+          const uint32_t v = h0 * w.wy0 + h1 * w.wy1;     // Q16
+          drow[x] = static_cast<uint16_t>((v + 32768u) >> 16);
+        }
+        continue;
+      }
+
+      for (int x = x0; x < std::min(xf0, x1 + 1); ++x) {
+        const int ix = x - w.cx;
+        const int ix0 = ClampInt(ix, 0, src_w - 1);
+        const int ix1c = ClampInt(ix0 + 1, 0, src_w - 1);
+
+        const uint32_t p00 = row0[ix0];
+        const uint32_t p10 = row0[ix1c];
+        const uint32_t p01 = row1[ix0];
+        const uint32_t p11 = row1[ix1c];
+
+        const uint32_t h0 = p00 * w.wx0 + p10 * w.wx1;  // Q8
+        const uint32_t h1 = p01 * w.wx0 + p11 * w.wx1;  // Q8
+        const uint32_t v = h0 * w.wy0 + h1 * w.wy1;     // Q16
+        drow[x] = static_cast<uint16_t>((v + 32768u) >> 16);
+      }
+
+      if (xf0 <= xf1) {
+        int x = xf0;
+#if defined(__SSE4_1__)
+        // 8 pixels at a time.
+        for (; x + 7 <= xf1; x += 8) {
+          const int ix = x - w.cx;
+
+          const __m128i s00 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row0 + ix));
+          const __m128i s10 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row0 + ix + 1));
+          const __m128i s01 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row1 + ix));
+          const __m128i s11 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row1 + ix + 1));
+
+          const __m128i in0_lo = _mm_unpacklo_epi16(s00, s10);
+          const __m128i in0_hi = _mm_unpackhi_epi16(s00, s10);
+          const __m128i in1_lo = _mm_unpacklo_epi16(s01, s11);
+          const __m128i in1_hi = _mm_unpackhi_epi16(s01, s11);
+
+          const __m128i h0_lo_32 = _mm_madd_epi16(in0_lo, wx_pair);
+          const __m128i h0_hi_32 = _mm_madd_epi16(in0_hi, wx_pair);
+          const __m128i h1_lo_32 = _mm_madd_epi16(in1_lo, wx_pair);
+          const __m128i h1_hi_32 = _mm_madd_epi16(in1_hi, wx_pair);
+
+          const __m128i h0_16 = _mm_packus_epi32(h0_lo_32, h0_hi_32);
+          const __m128i h1_16 = _mm_packus_epi32(h1_lo_32, h1_hi_32);
+
+          const __m128i vin_lo = _mm_unpacklo_epi16(h0_16, h1_16);
+          const __m128i vin_hi = _mm_unpackhi_epi16(h0_16, h1_16);
+
+          const __m128i v_lo_32 = _mm_madd_epi16(vin_lo, wy_pair);
+          const __m128i v_hi_32 = _mm_madd_epi16(vin_hi, wy_pair);
+
+          const __m128i v_lo = _mm_srli_epi32(_mm_add_epi32(v_lo_32, _mm_set1_epi32(32768)), 16);
+          const __m128i v_hi = _mm_srli_epi32(_mm_add_epi32(v_hi_32, _mm_set1_epi32(32768)), 16);
+
+          const __m128i v_16 = _mm_packus_epi32(v_lo, v_hi);
+
+          _mm_storeu_si128(reinterpret_cast<__m128i*>(drow + x), v_16);
+        }
+#endif
+        for (; x <= xf1; ++x) {
+          const int ix = x - w.cx;
+          const uint32_t p00 = row0[ix];
+          const uint32_t p10 = row0[ix + 1];
+          const uint32_t p01 = row1[ix];
+          const uint32_t p11 = row1[ix + 1];
+
+          const uint32_t h0 = p00 * w.wx0 + p10 * w.wx1;  // Q8
+          const uint32_t h1 = p01 * w.wx0 + p11 * w.wx1;  // Q8
+          const uint32_t v = h0 * w.wy0 + h1 * w.wy1;     // Q16
+          drow[x] = static_cast<uint16_t>((v + 32768u) >> 16);
+        }
+      }
+
+      for (int x = std::max(xf1 + 1, x0); x <= x1; ++x) {
+        const int ix = x - w.cx;
+        const int ix0 = ClampInt(ix, 0, src_w - 1);
+        const int ix1c = ClampInt(ix0 + 1, 0, src_w - 1);
+
+        const uint32_t p00 = row0[ix0];
+        const uint32_t p10 = row0[ix1c];
+        const uint32_t p01 = row1[ix0];
+        const uint32_t p11 = row1[ix1c];
+
+        const uint32_t h0 = p00 * w.wx0 + p10 * w.wx1;  // Q8
+        const uint32_t h1 = p01 * w.wx0 + p11 * w.wx1;  // Q8
+        const uint32_t v = h0 * w.wy0 + h1 * w.wy1;     // Q16
+        drow[x] = static_cast<uint16_t>((v + 32768u) >> 16);
+      }
     }
-  }
-}
+  };
 
+  BlitWorkerPool::Instance().ParallelFor(y0, y1 + 1, 32, blit_rows);
+}
 // Bilinear blit for P010 UV plane (interleaved UV, 16-bit each).
 // src_w/src_h and dst_w/dst_h are chroma sizes (width/2, height/2).
 void BlitPlaneBilinearP010UV(const uint8_t* src_bytes,
@@ -1132,61 +1557,106 @@ void BlitPlaneBilinearP010UV(const uint8_t* src_bytes,
   if (!src_bytes || !dst_bytes) return;
   if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return;
 
-  const int x0 = std::max(0, static_cast<int>(std::ceil(dst_x)));
-  const int y0 = std::max(0, static_cast<int>(std::ceil(dst_y)));
-  const int x1 = std::min(dst_w - 1, static_cast<int>(std::floor(dst_x + src_w - 1.0)));
-  const int y1 = std::min(dst_h - 1, static_cast<int>(std::floor(dst_y + src_h - 1.0)));
+  const FixedWeightsQ8 w = ComputeFixedWeightsQ8(dst_x, dst_y);
+  const int x0 = ComputeDstX0(dst_x);
+  const int y0 = ComputeDstY0(dst_y);
+  const int x1 = ComputeDstX1(dst_w, dst_x, src_w);
+  const int y1 = ComputeDstY1(dst_h, dst_y, src_h);
   if (x0 > x1 || y0 > y1) return;
 
-  for (int y = y0; y <= y1; ++y) {
-    const double sy = static_cast<double>(y) - dst_y;
-    const int iy0 = ClampInt(static_cast<int>(std::floor(sy)), 0, src_h - 1);
-    const int iy1 = ClampInt(iy0 + 1, 0, src_h - 1);
-    const double fy = ClampDouble(sy - std::floor(sy), 0.0, 1.0);
+  const int xf0 = std::max(x0, w.cx);
+  const int yf0 = std::max(y0, w.cy);
+  const int xf1 = std::min(x1, w.cx + src_w - 2);
+  const int yf1 = std::min(y1, w.cy + src_h - 2);
 
-    const uint16_t* row0 =
-        reinterpret_cast<const uint16_t*>(src_bytes + iy0 * src_linesize);
-    const uint16_t* row1 =
-        reinterpret_cast<const uint16_t*>(src_bytes + iy1 * src_linesize);
-    uint16_t* drow =
-        reinterpret_cast<uint16_t*>(dst_bytes + y * dst_linesize);
+  auto blit_rows = [&](int y_begin, int y_end) {
+    for (int y = y_begin; y < y_end; ++y) {
+      const int iy = y - w.cy;
+      const bool y_fast = (y >= yf0 && y <= yf1);
+      const int iy0 = y_fast ? iy : ClampInt(iy, 0, src_h - 1);
+      const int iy1 = y_fast ? (iy + 1) : ClampInt(iy0 + 1, 0, src_h - 1);
 
-    for (int x = x0; x <= x1; ++x) {
-      const double sx = static_cast<double>(x) - dst_x;
-      const int ix0 = ClampInt(static_cast<int>(std::floor(sx)), 0, src_w - 1);
-      const int ix1 = ClampInt(ix0 + 1, 0, src_w - 1);
-      const double fx = ClampDouble(sx - std::floor(sx), 0.0, 1.0);
+      const uint16_t* row0 =
+          reinterpret_cast<const uint16_t*>(src_bytes + iy0 * src_linesize);
+      const uint16_t* row1 =
+          reinterpret_cast<const uint16_t*>(src_bytes + iy1 * src_linesize);
+      uint16_t* drow =
+          reinterpret_cast<uint16_t*>(dst_bytes + y * dst_linesize);
 
-      const double w00 = (1.0 - fx) * (1.0 - fy);
-      const double w10 = fx * (1.0 - fy);
-      const double w01 = (1.0 - fx) * fy;
-      const double w11 = fx * fy;
+      // For P010 UV plane: interleaved (U,V) 16-bit words.
+      auto sample_uv = [&](const uint16_t* r0, const uint16_t* r1, int ix0, int ix1c,
+                           uint16_t* out_u, uint16_t* out_v) {
+        const int o00 = 2 * ix0;
+        const int o10 = 2 * ix1c;
 
-      const int o00 = 2 * ix0;
-      const int o10 = 2 * ix1;
+        const uint32_t u00 = r0[o00 + 0];
+        const uint32_t v00 = r0[o00 + 1];
+        const uint32_t u10 = r0[o10 + 0];
+        const uint32_t v10 = r0[o10 + 1];
 
-      const double u00 = static_cast<double>(row0[o00 + 0]);
-      const double v00 = static_cast<double>(row0[o00 + 1]);
-      const double u10 = static_cast<double>(row0[o10 + 0]);
-      const double v10 = static_cast<double>(row0[o10 + 1]);
-      const double u01 = static_cast<double>(row1[o00 + 0]);
-      const double v01 = static_cast<double>(row1[o00 + 1]);
-      const double u11 = static_cast<double>(row1[o10 + 0]);
-      const double v11 = static_cast<double>(row1[o10 + 1]);
+        const uint32_t u01 = r1[o00 + 0];
+        const uint32_t v01 = r1[o00 + 1];
+        const uint32_t u11 = r1[o10 + 0];
+        const uint32_t v11 = r1[o10 + 1];
 
-      const double u = w00 * u00 + w10 * u10 + w01 * u01 + w11 * u11;
-      const double v = w00 * v00 + w10 * v10 + w01 * v01 + w11 * v11;
+        const uint32_t hu0 = u00 * w.wx0 + u10 * w.wx1;  // Q8
+        const uint32_t hu1 = u01 * w.wx0 + u11 * w.wx1;
+        const uint32_t hv0 = v00 * w.wx0 + v10 * w.wx1;
+        const uint32_t hv1 = v01 * w.wx0 + v11 * w.wx1;
 
-      const int du = ClampInt(static_cast<int>(std::lround(u)), 0, 65535);
-      const int dv = ClampInt(static_cast<int>(std::lround(v)), 0, 65535);
+        const uint32_t u = hu0 * w.wy0 + hu1 * w.wy1;  // Q16
+        const uint32_t v = hv0 * w.wy0 + hv1 * w.wy1;  // Q16
 
-      drow[2 * x + 0] = static_cast<uint16_t>(du);
-      drow[2 * x + 1] = static_cast<uint16_t>(dv);
+        *out_u = static_cast<uint16_t>((u + 32768u) >> 16);
+        *out_v = static_cast<uint16_t>((v + 32768u) >> 16);
+      };
+
+      if (!y_fast) {
+        for (int x = x0; x <= x1; ++x) {
+          const int ix = x - w.cx;
+          const int ix0 = ClampInt(ix, 0, src_w - 1);
+          const int ix1c = ClampInt(ix0 + 1, 0, src_w - 1);
+          uint16_t u = 0, v = 0;
+          sample_uv(row0, row1, ix0, ix1c, &u, &v);
+          drow[2 * x + 0] = u;
+          drow[2 * x + 1] = v;
+        }
+        continue;
+      }
+
+      for (int x = x0; x < std::min(xf0, x1 + 1); ++x) {
+        const int ix = x - w.cx;
+        const int ix0 = ClampInt(ix, 0, src_w - 1);
+        const int ix1c = ClampInt(ix0 + 1, 0, src_w - 1);
+        uint16_t u = 0, v = 0;
+        sample_uv(row0, row1, ix0, ix1c, &u, &v);
+        drow[2 * x + 0] = u;
+        drow[2 * x + 1] = v;
+      }
+
+      for (int x = xf0; x <= xf1; ++x) {
+        const int ix = x - w.cx;
+        // No clamp in interior.
+        uint16_t u = 0, v = 0;
+        sample_uv(row0, row1, ix, ix + 1, &u, &v);
+        drow[2 * x + 0] = u;
+        drow[2 * x + 1] = v;
+      }
+
+      for (int x = std::max(xf1 + 1, x0); x <= x1; ++x) {
+        const int ix = x - w.cx;
+        const int ix0 = ClampInt(ix, 0, src_w - 1);
+        const int ix1c = ClampInt(ix0 + 1, 0, src_w - 1);
+        uint16_t u = 0, v = 0;
+        sample_uv(row0, row1, ix0, ix1c, &u, &v);
+        drow[2 * x + 0] = u;
+        drow[2 * x + 1] = v;
+      }
     }
-  }
+  };
+
+  BlitWorkerPool::Instance().ParallelFor(y0, y1 + 1, 32, blit_rows);
 }
-
-
 // ---------------- Remux audio (smart: copy AAC, transcode others to AAC) ----------------
 
 static bool VerifyMediaReadable(const std::string& path, std::string* err) {
