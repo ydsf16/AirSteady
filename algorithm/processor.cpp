@@ -91,7 +91,7 @@ bool Processor::StartStabilize(std::string* err_info) {
 }
 
 void Processor::AddStableFinishedCallback(StableFinishedCallback cb) {
-  stable_finished_cbs_.push_back(std::move(cb));
+  stabilizer_->AddFinishedCallback(cb);
 }
 
 bool Processor::UpdateParamAndRestable(const StableParams& stable_params, std::string* err_info) {

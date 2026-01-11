@@ -3,6 +3,7 @@
 #include <QMainWindow>
 #include <QTimer>
 #include <memory>
+#include <QSplitter>
 
 #include <opencv2/opencv.hpp>
 
@@ -81,6 +82,7 @@ class MainWindow : public QMainWindow {
   VideoView* raw_view_ = nullptr;
   VideoView* steady_view_ = nullptr;
   ControlPanel* control_panel_ = nullptr;
+  QSplitter* center_splitter_handler_ = nullptr;
 
   // 底部播放控制
   QToolButton* play_btn_ = nullptr;

@@ -80,9 +80,10 @@ void MainWindow::buildUi() {
   center_splitter->setStretchFactor(0, 1);
   center_splitter->setStretchFactor(1, 2);
   center_splitter->setStretchFactor(2, 0);
-  center_splitter->setSizes({400, 800, 320});
+  center_splitter->setSizes({600, 600, 320});
   raw_view_->setMinimumWidth(240);
   steady_view_->setMinimumWidth(360);
+  center_splitter_handler_ = center_splitter;
 
   // 底部播放控制
   play_btn_ = new QToolButton(this);
@@ -210,9 +211,16 @@ void MainWindow::onOpenClicked() {
   video_processor_->AddExportDoneCallback([this]() {
       onExportDone();
     });
+  
+    video_processor_->AddStableFinishedCallback([this]() {
+      OnStablePlaneFinished();
+    });
 
   // Start tracking!!!
   video_processor_->StartTracking(&err);
+
+  center_splitter_handler_->setSizes({center_splitter_handler_->width() * 10 / 10, 
+  center_splitter_handler_->width() * 0 / 10, 320});
 }
 
 void MainWindow::onExportClicked() {
@@ -339,6 +347,10 @@ void MainWindow::OnTrackFinished() {
 }
 
 void MainWindow::OnStablePlaneFinished() {
+  center_splitter_handler_->setSizes(
+    {center_splitter_handler_->width() * 2 / 10, 
+    center_splitter_handler_->width() * 8 / 10, 
+    320});
 }
 
 void MainWindow::onPreviewDone() {

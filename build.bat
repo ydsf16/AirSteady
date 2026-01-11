@@ -2,7 +2,7 @@
 setlocal
 
 rem ====== config vcpkg path ======
-set "VCPKG_ROOT=C:\Users\Admin\vcpkg"
+set "VCPKG_ROOT=C:\Users\dongsheng\Desktop\AirSteady\vcpkg"
 
 if not exist "%VCPKG_ROOT%\vcpkg.exe" (
     echo ERROR: vcpkg.exe not found at "%VCPKG_ROOT%".
