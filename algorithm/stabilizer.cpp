@@ -954,6 +954,19 @@ std::vector<FrameStableResult> Stabilizer::ComputeStabilizedResults(
       r.delta_y = 0.0;
       LOG(FATAL) << "Must not be here!!!";
     }
+
+    // TODO: Limit max delta.
+    if (r.delta_x > config_.max_delta) {
+      r.delta_x = config_.max_delta;
+    } else if (r.delta_x < -config_.max_delta) {
+      r.delta_x = config_.max_delta;
+    }
+    if (r.delta_y > config_.max_delta) {
+      r.delta_y = config_.max_delta;
+    } else if (r.delta_y < -config_.max_delta) {
+      r.delta_y = config_.max_delta;
+    }
+
     out.push_back(r);
   }
   return out;
