@@ -8,13 +8,29 @@
 
 ### 1. 软件使用演示
 
-[B 站 @AirSteady](https://www.bilibili.com/video/BV1ivmaBvE4q/?vd_source=148fbb79ec54d79299ca9ee1039fcda4) 📹
+<iframe src="//player.bilibili.com/player.html?bvid=BV1ivmaBvE4q&page=1" 
+        scrolling="no" 
+        border="0" 
+        frameborder="no" 
+        framespacing="0" 
+        allowfullscreen="true"
+        width="100%"
+        height="500">
+</iframe>
 
 ### 2. F-22 处理前后对比
 
-[B 站 @AirSteady](https://www.bilibili.com/video/BV1ivmaBvE4q/?vd_source=148fbb79ec54d79299ca9ee1039fcda4) 📹
+<iframe src="//player.bilibili.com/player.html?bvid=BV1ivmaBvE4q&page=1" 
+        scrolling="no" 
+        border="0" 
+        frameborder="no" 
+        framespacing="0" 
+        allowfullscreen="true"
+        width="100%"
+        height="500">
+</iframe>
 
-> 💡 点击链接到 B 站观看，高清流畅～
+> 💡 如果视频无法加载，请[到 B 站观看](https://www.bilibili.com/video/BV1ivmaBvE4q/)
 
 ---
 
