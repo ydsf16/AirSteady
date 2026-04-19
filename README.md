@@ -16,7 +16,9 @@
 
 > 点击图片到 B 站观看高清视频
 
-更多作品：[抖音 @AirSteady](https://www.douyin.com/user/MS4wLjABAAAAkB0g12Ry0z-bBjHmGffv-JpfWJpEF_BR2wQumAR2grnhn1S4SuS7KmV761Bi8Iid?from_tab_name=main) | [GitHub @ydsf16/AirSteady](https://github.com/ydsf16/AirSteady)
+更多作品：[抖音 @AirSteady](https://www.douyin.com/user/MS4wLjABAAAAkB0g12Ry0z-bBjHmGffv-JpfWJpEF_BR2wQumAR2grnhn1S4SuS7KmV761Bi8Iid?from_tab_name=main) |
+
+开源代码： [GitHub @ydsf16/AirSteady](https://github.com/ydsf16/AirSteady)
 
 ---
 
