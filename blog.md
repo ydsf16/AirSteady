@@ -6,31 +6,13 @@
 
 ## 演示视频
 
-### 1. 软件使用演示
+### 软件使用演示 + F-22 处理对比
 
-<iframe src="//player.bilibili.com/player.html?bvid=BV1ivmaBvE4q&page=1" 
-        scrolling="no" 
-        border="0" 
-        frameborder="no" 
-        framespacing="0" 
-        allowfullscreen="true"
-        width="100%"
-        height="500">
-</iframe>
+<video controls width="640">
+  <source src="resources/F22.mp4" type="video/mp4">
+</video>
 
-### 2. F-22 处理前后对比
-
-<iframe src="//player.bilibili.com/player.html?bvid=BV1ivmaBvE4q&page=1" 
-        scrolling="no" 
-        border="0" 
-        frameborder="no" 
-        framespacing="0" 
-        allowfullscreen="true"
-        width="100%"
-        height="500">
-</iframe>
-
-> 💡 如果视频无法加载，请[到 B 站观看](https://www.bilibili.com/video/BV1ivmaBvE4q/)
+> F-22 视频演示了 AirSteady 的完整处理流程和处理效果
 
 ---
 
