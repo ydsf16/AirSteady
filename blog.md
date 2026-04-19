@@ -6,13 +6,17 @@
 
 ## 演示视频
 
-### 软件使用演示 + F-22 处理对比
+### 1. 软件使用演示
 
-<video controls width="640">
-  <source src="resources/F22.mp4" type="video/mp4">
-</video>
+[![AirSteady 软件使用演示](resources/AirSteady.png)](https://www.bilibili.com/video/BV1AodfByEnP/)
 
-> F-22 视频演示了 AirSteady 的完整处理流程和处理效果
+### 2. F-22 处理前后对比
+
+[![F-22 处理前后对比](resources/F22.png)](https://www.bilibili.com/video/BV1ivmaBvE4q/)
+
+> 点击图片到 B 站观看高清视频
+
+更多作品：[抖音 @AirSteady](https://www.douyin.com/user/MS4wLjABAAAAkB0g12Ry0z-bBjHmGffv-JpfWJpEF_BR2wQumAR2grnhn1S4SuS7KmV761Bi8Iid?from_tab_name=main) | [GitHub @ydsf16/AirSteady](https://github.com/ydsf16/AirSteady)
 
 ---
 
@@ -217,7 +221,6 @@ YOLO 推理需要适配不同 GPU：
 |------|------|--------|
 | 目标点选确认 | 用户点击画面选择跟踪目标 | 🔴 高 |
 | 跟丢状态机 | LOST 状态检测 + UI 提示 | 🔴 高 |
-| 水印功能 | 添加"AirSteady"标识 | 🟡 中 |
 | 多目标跟踪 | UI 交互切换跟踪目标 | 🟡 中 |
 | 关键帧裁切 | 动态裁切平衡稳定/视野 | 🟢 低 |
 
@@ -238,19 +241,10 @@ YOLO 推理需要适配不同 GPU：
 - 非必须：对航模/拍机/打鸟有兴趣 😄
 
 ### 长期愿景
+
 - **打造开放的航空摄影爱好者开源软件** —— 造福全球航空爱好者
 - **批量处理功能** —— 拍摄一天视频，批量导入处理，第二天直接验收结果
 - **自动跟拍云台** —— 结合硬件实现长焦自动跟踪，原理类似光学雷达锁定（军迷懂的！）
-
-
----
-
-## 联系方式
-
-- **GitHub**: [ydsf16/AirSteady](https://github.com/ydsf16/AirSteady) 🌟 欢迎 Star & Fork
-- **B 站**: [@AirSteady](https://space.bilibili.com/你的空间 ID) 📹 更多视频
-- **微信/邮箱**: 可通过 GitHub Issue 或 B 站私信联系
-- **项目讨论群**: 见 GitHub 仓库首页
 
 ---
 
@@ -272,12 +266,3 @@ YOLO 推理需要适配不同 GPU：
 *如果你也对航空摄影、计算机视觉、开源协作有兴趣，欢迎来聊聊！*
 
 *一起把这个工具做好，让拍飞机的人都能轻松获得"云台级"稳像视频。*
-
----
-
-**TODOs for this blog:**
-- [x] 补充 GitHub 仓库链接
-- [x] 添加抖音账号/作品链接
-- [x] 添加演示视频链接
-- [ ] 添加 UI 操作演示视频
-- [ ] 绘制技术框架图
